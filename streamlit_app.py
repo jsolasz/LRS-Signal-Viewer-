@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import io
+import importlib.util
 import json
 from datetime import datetime, time, timedelta
 from pathlib import Path
@@ -15,7 +16,22 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-import futures_trade_mapper as ftm
+try:
+    import futures_trade_mapper as ftm
+except ModuleNotFoundError:
+    module_path = Path(__file__).resolve().with_name("futures_trade_mapper.py")
+    if not module_path.exists():
+        st.error(
+            "Could not import `futures_trade_mapper` and file was not found next to "
+            "`streamlit_app.py`. Ensure both files are committed to the repo root."
+        )
+        st.stop()
+    spec = importlib.util.spec_from_file_location("futures_trade_mapper", module_path)
+    if spec is None or spec.loader is None:
+        st.error("Failed to load `futures_trade_mapper.py` from disk.")
+        st.stop()
+    ftm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ftm)
 
 try:
     from streamlit_autorefresh import st_autorefresh
