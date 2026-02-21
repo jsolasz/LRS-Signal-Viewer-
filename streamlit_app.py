@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import csv
 import io
+import importlib.util
 import json
 from datetime import datetime, time, timedelta
+from pathlib import Path
 from typing import Dict, List, Tuple
 from zoneinfo import ZoneInfo
 
@@ -14,7 +16,30 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-import futures_trade_mapper as ftm
+try:
+    import futures_trade_mapper as ftm
+except ModuleNotFoundError as exc:
+    # If a dependency inside futures_trade_mapper is missing, surface that explicitly.
+    if exc.name and exc.name != "futures_trade_mapper":
+        st.error(
+            f"Missing dependency: `{exc.name}`. Add it to requirements.txt and redeploy."
+        )
+        st.stop()
+
+    module_path = Path(__file__).resolve().with_name("futures_trade_mapper.py")
+    if not module_path.exists():
+        st.error(
+            "Could not find `futures_trade_mapper.py` next to `streamlit_app.py`. "
+            "Commit/push both files to the deployed repo."
+        )
+        st.stop()
+
+    spec = importlib.util.spec_from_file_location("futures_trade_mapper", module_path)
+    if spec is None or spec.loader is None:
+        st.error("Failed to load futures_trade_mapper module from file.")
+        st.stop()
+    ftm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ftm)
 
 try:
     from streamlit_autorefresh import st_autorefresh
