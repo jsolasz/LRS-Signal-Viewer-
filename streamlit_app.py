@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import csv
 import io
-import importlib.util
 import json
 from datetime import datetime, time, timedelta
 from pathlib import Path
@@ -16,30 +15,7 @@ import altair as alt
 import pandas as pd
 import streamlit as st
 
-try:
-    import futures_trade_mapper as ftm
-except ModuleNotFoundError as exc:
-    # If a dependency inside futures_trade_mapper is missing, surface that explicitly.
-    if exc.name and exc.name != "futures_trade_mapper":
-        st.error(
-            f"Missing dependency: `{exc.name}`. Add it to requirements.txt and redeploy."
-        )
-        st.stop()
-
-    module_path = Path(__file__).resolve().with_name("futures_trade_mapper.py")
-    if not module_path.exists():
-        st.error(
-            "Could not find `futures_trade_mapper.py` next to `streamlit_app.py`. "
-            "Commit/push both files to the deployed repo."
-        )
-        st.stop()
-
-    spec = importlib.util.spec_from_file_location("futures_trade_mapper", module_path)
-    if spec is None or spec.loader is None:
-        st.error("Failed to load futures_trade_mapper module from file.")
-        st.stop()
-    ftm = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(ftm)
+import futures_trade_mapper as ftm
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -49,6 +25,9 @@ except Exception:
     HAS_ST_AUTOREFRESH = False
 
 ET = ZoneInfo("America/New_York")
+SCRIPT_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = SCRIPT_DIR / ".uploaded_trades"
+UPLOAD_DIR.mkdir(exist_ok=True)
 SIZE_FRACTIONS = [0.50, 0.25, 0.25]
 CONTRACT_MULTIPLIERS = {
     "ES": 50.0,
@@ -112,6 +91,23 @@ ASSET_CLASS_BY_ROOT = {
     "6A": "FX",
     "6S": "FX",
 }
+MASTER_PASSWORD = "NewDay1574!"
+
+
+def _require_password() -> None:
+    if st.session_state.get("is_authenticated", False):
+        return
+
+    st.title("Protected App")
+    st.caption("Enter password to access the dashboard.")
+    pw = st.text_input("Password", type="password")
+    if st.button("Unlock"):
+        if pw == MASTER_PASSWORD:
+            st.session_state["is_authenticated"] = True
+            st.rerun()
+        else:
+            st.error("Invalid password")
+    st.stop()
 
 
 def _load_rows_from_bytes(file_name: str, raw_bytes: bytes) -> List[Dict[str, str]]:
@@ -166,6 +162,25 @@ def _load_rows_from_bytes(file_name: str, raw_bytes: bytes) -> List[Dict[str, st
             }
         )
     return rows
+
+
+def _save_uploaded_files(uploaded_files) -> List[Path]:
+    saved_paths: List[Path] = []
+    for uf in uploaded_files:
+        path = UPLOAD_DIR / uf.name
+        path.write_bytes(uf.getvalue())
+        saved_paths.append(path)
+    return saved_paths
+
+
+def _load_rows_from_saved_files(paths: List[Path]) -> List[Dict[str, str]]:
+    all_rows: List[Dict[str, str]] = []
+    for path in paths:
+        try:
+            all_rows.extend(_load_rows_from_bytes(path.name, path.read_bytes()))
+        except Exception:
+            continue
+    return all_rows
 
 
 def _state_bucket(row: Dict[str, str]) -> Tuple[str, str, str]:
@@ -1177,6 +1192,7 @@ def _build_price_levels_chart(bars: pd.DataFrame, row: Dict[str, str]):
 
 def main() -> None:
     st.set_page_config(page_title="Futures Trade Monitor", layout="wide")
+    _require_password()
     st.title("Futures Trade Monitor")
     st.caption("Live table of trade states with entry/target/stop progression")
     start_et, end_et = _session_window_et()
@@ -1191,6 +1207,7 @@ def main() -> None:
         auto_refresh = st.checkbox("Enable auto refresh", value=False)
         refresh_seconds = st.slider("Refresh seconds", min_value=5, max_value=120, value=20, step=5)
         manual_refresh = st.button("Refresh now")
+        clear_files = st.button("Clear uploaded files")
 
     if manual_refresh:
         st.rerun()
@@ -1202,17 +1219,22 @@ def main() -> None:
         help="Upload one or more trade sheets (e.g., eqint and Global_Macro).",
     )
 
-    if not uploaded_files:
+    if clear_files:
+        for p in UPLOAD_DIR.glob("*.csv"):
+            p.unlink(missing_ok=True)
+        st.success("Cleared saved uploaded files.")
+
+    if uploaded_files:
+        saved_paths = _save_uploaded_files(uploaded_files)
+    else:
+        saved_paths = sorted(UPLOAD_DIR.glob("*.csv"))
+
+    if not saved_paths:
         st.info("Upload your trade CSV files to start the live table.")
         return
 
-    st.caption("Using uploaded files (session-only): " + ", ".join(f.name for f in uploaded_files))
-    input_rows: List[Dict[str, str]] = []
-    for uf in uploaded_files:
-        try:
-            input_rows.extend(_load_rows_from_bytes(uf.name, uf.getvalue()))
-        except Exception:
-            continue
+    st.caption("Using uploaded files: " + ", ".join(p.name for p in saved_paths))
+    input_rows = _load_rows_from_saved_files(saved_paths)
 
     if auto_refresh and HAS_ST_AUTOREFRESH:
         st_autorefresh(interval=refresh_seconds * 1000, key="trade_table_refresh")
