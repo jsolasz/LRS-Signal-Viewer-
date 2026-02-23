@@ -181,7 +181,31 @@ def _load_rows_from_bytes(file_name: str, raw_bytes: bytes) -> List[Dict[str, st
 
 
 def _parse_price_with_root(value: object, root: object) -> float:
-    parsed = ftm.parse_price(str(value), str(root or ""))
+    text = str(value)
+    root_text = str(root or "").upper()
+
+    # Prefer mapper's root-aware parser when available.
+    if hasattr(ftm, "parse_price"):
+        parsed = ftm.parse_price(text, root_text)
+        return 0.0 if parsed is None else float(parsed)
+
+    # Backward-compat fallback: handle ZN/ZB 32nds sheet format locally.
+    if root_text in {"ZN", "ZB"}:
+        import re
+
+        match = re.fullmatch(r"\s*([+-]?\d+)\.(\d{3})\s*", text)
+        if match:
+            whole_text, frac_text = match.groups()
+            try:
+                whole = int(whole_text)
+                frac_32 = int(frac_text) / 10.0
+                sign = -1.0 if whole < 0 else 1.0
+                return float(whole) + sign * (frac_32 / 32.0)
+            except ValueError:
+                pass
+
+    # Final fallback for older mapper versions.
+    parsed = ftm.parse_float(text)
     return 0.0 if parsed is None else float(parsed)
 
 
