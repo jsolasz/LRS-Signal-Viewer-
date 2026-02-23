@@ -1131,6 +1131,9 @@ def _session_window_et() -> Tuple[datetime, datetime]:
 def _choose_history_live_window(row: Dict[str, str], mode: str, history_cache: Dict[str, object]):
     start_et, end_et = _session_window_et()
     last_error = "No history candidates"
+    best_symbol = ""
+    best_hist = None
+    best_score = None
 
     for symbol in ftm.resolve_history_symbol(row, mode):
         cache_key = f"{symbol}|{start_et.isoformat()}|{end_et.isoformat()}"
@@ -1160,9 +1163,22 @@ def _choose_history_live_window(row: Dict[str, str], mode: str, history_cache: D
 
         hist = history_cache[cache_key]
         if hist is not None and {"High", "Low", "Open", "Close"}.issubset(set(hist.columns)):
-            return symbol, hist, ""
+            first_ts = pd.to_datetime(hist.index.min())
+            start_gap_seconds = max(0.0, (first_ts - start_et).total_seconds())
+            bar_count = len(hist)
+            # Prefer earliest coverage from 6pm, then larger bar count.
+            score = (start_gap_seconds, -bar_count)
+            if best_score is None or score < best_score:
+                best_score = score
+                best_symbol = symbol
+                best_hist = hist
+                if start_gap_seconds <= 900 and bar_count >= 24:
+                    # Good enough coverage (~15min from session open).
+                    break
         last_error = f"No intraday bars for {symbol}"
 
+    if best_hist is not None:
+        return best_symbol, best_hist, ""
     return "", None, last_error
 
 
@@ -1489,6 +1505,7 @@ def main() -> None:
         else:
             st.caption(f"Symbol: {history_symbol}")
             try:
+                expected_start, _ = _session_window_et()
                 loaded_start = pd.to_datetime(bars.index.min()).tz_convert(ET)
                 loaded_end = pd.to_datetime(bars.index.max()).tz_convert(ET)
                 st.caption(
@@ -1496,6 +1513,11 @@ def main() -> None:
                     f"{loaded_start.strftime('%Y-%m-%d %I:%M %p ET')} to "
                     f"{loaded_end.strftime('%Y-%m-%d %I:%M %p ET')}"
                 )
+                if loaded_start > expected_start + timedelta(minutes=15):
+                    st.warning(
+                        "Data source started after the 6:00 PM ET session open for this symbol. "
+                        "Using best available intraday coverage."
+                    )
             except Exception:
                 pass
             st.altair_chart(_build_price_levels_chart(bars, selected_row), use_container_width=True)
