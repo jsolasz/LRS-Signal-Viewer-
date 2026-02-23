@@ -168,6 +168,34 @@ def parse_float(text: str) -> Optional[float]:
         return None
 
 
+def parse_price(text: str, root: Optional[str] = None) -> Optional[float]:
+    """Parse price text with root-aware handling.
+
+    For ZN/ZB levels in sheet format (e.g. 113.240), treat the 3-digit
+    fractional block as 32nds-tenths:
+    - 113.240 -> 113 + 24.0/32
+    - 113.025 -> 113 + 2.5/32
+    """
+    v = text.strip()
+    if not v or v == "-":
+        return None
+
+    # 32nds encoding support for CBOT rates where levels are in 1/32 increments.
+    if (root or "").upper() in {"ZN", "ZB"}:
+        match = re.fullmatch(r"\s*([+-]?\d+)\.(\d{3})\s*", v)
+        if match:
+            whole_text, frac_text = match.groups()
+            try:
+                whole = int(whole_text)
+                frac_32 = int(frac_text) / 10.0
+                sign = -1.0 if whole < 0 else 1.0
+                return float(whole) + sign * (frac_32 / 32.0)
+            except ValueError:
+                pass
+
+    return parse_float(v)
+
+
 def infer_year(yy_text: str, reference_year: Optional[int]) -> int:
     if len(yy_text) == 2:
         return 2000 + int(yy_text)
@@ -419,11 +447,12 @@ def bar_hits_target(side: str, target: float, high: float, low: float) -> bool:
 
 def simulate_trade(row: Dict[str, str], bars, intrabar_policy: str) -> TradeState:
     side = row.get("side", "")
-    entry = parse_float(row.get("entry", ""))
-    stop = parse_float(row.get("stop", ""))
-    t1 = parse_float(row.get("target1", ""))
-    t2 = parse_float(row.get("target2", ""))
-    t3 = parse_float(row.get("target3", ""))
+    root = row.get("root", "")
+    entry = parse_price(row.get("entry", ""), root)
+    stop = parse_price(row.get("stop", ""), root)
+    t1 = parse_price(row.get("target1", ""), root)
+    t2 = parse_price(row.get("target2", ""), root)
+    t3 = parse_price(row.get("target3", ""), root)
 
     if side not in {"L", "S"} or None in {entry, stop, t1, t2, t3}:
         return TradeState(
