@@ -9,7 +9,7 @@ import importlib.util
 import json
 from datetime import datetime, time, timedelta
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import altair as alt
@@ -180,14 +180,14 @@ def _load_rows_from_bytes(file_name: str, raw_bytes: bytes) -> List[Dict[str, st
     return rows
 
 
-def _parse_price_with_root(value: object, root: object) -> float:
+def _parse_price_with_root(value: object, root: object) -> Optional[float]:
     text = str(value)
     root_text = str(root or "").upper()
 
     # Prefer mapper's root-aware parser when available.
     if hasattr(ftm, "parse_price"):
         parsed = ftm.parse_price(text, root_text)
-        return 0.0 if parsed is None else float(parsed)
+        return None if parsed is None else float(parsed)
 
     # Backward-compat fallback: handle ZN/ZB 32nds sheet format locally.
     if root_text in {"ZN", "ZB"}:
@@ -206,7 +206,7 @@ def _parse_price_with_root(value: object, root: object) -> float:
 
     # Final fallback for older mapper versions.
     parsed = ftm.parse_float(text)
-    return 0.0 if parsed is None else float(parsed)
+    return None if parsed is None else float(parsed)
 
 
 def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -214,15 +214,35 @@ def _ensure_price_columns(df: pd.DataFrame) -> pd.DataFrame:
         return df
     work = df.copy()
     if "entry_num" not in work.columns:
-        work["entry_num"] = work.apply(lambda r: _parse_price_with_root(r.get("entry", ""), r.get("root", "")), axis=1)
+        work["entry_num"] = (
+            work.apply(lambda r: _parse_price_with_root(r.get("entry", ""), r.get("root", "")), axis=1)
+            .fillna(0.0)
+            .astype(float)
+        )
     if "stop_num" not in work.columns:
-        work["stop_num"] = work.apply(lambda r: _parse_price_with_root(r.get("stop", ""), r.get("root", "")), axis=1)
+        work["stop_num"] = (
+            work.apply(lambda r: _parse_price_with_root(r.get("stop", ""), r.get("root", "")), axis=1)
+            .fillna(0.0)
+            .astype(float)
+        )
     if "target1_num" not in work.columns:
-        work["target1_num"] = work.apply(lambda r: _parse_price_with_root(r.get("target1", ""), r.get("root", "")), axis=1)
+        work["target1_num"] = (
+            work.apply(lambda r: _parse_price_with_root(r.get("target1", ""), r.get("root", "")), axis=1)
+            .fillna(0.0)
+            .astype(float)
+        )
     if "target2_num" not in work.columns:
-        work["target2_num"] = work.apply(lambda r: _parse_price_with_root(r.get("target2", ""), r.get("root", "")), axis=1)
+        work["target2_num"] = (
+            work.apply(lambda r: _parse_price_with_root(r.get("target2", ""), r.get("root", "")), axis=1)
+            .fillna(0.0)
+            .astype(float)
+        )
     if "target3_num" not in work.columns:
-        work["target3_num"] = work.apply(lambda r: _parse_price_with_root(r.get("target3", ""), r.get("root", "")), axis=1)
+        work["target3_num"] = (
+            work.apply(lambda r: _parse_price_with_root(r.get("target3", ""), r.get("root", "")), axis=1)
+            .fillna(0.0)
+            .astype(float)
+        )
     return work
 
 
@@ -623,9 +643,9 @@ def _build_portfolio_snapshot(display_df: pd.DataFrame) -> pd.DataFrame:
         targets_hit = max(0, min(3, targets_hit))
 
         t_vals = [
-            ftm.parse_price(str(r.get("target1", "")), root),
-            ftm.parse_price(str(r.get("target2", "")), root),
-            ftm.parse_price(str(r.get("target3", "")), root),
+            _parse_price_with_root(r.get("target1", ""), root),
+            _parse_price_with_root(r.get("target2", ""), root),
+            _parse_price_with_root(r.get("target3", ""), root),
         ]
         fractions = SIZE_FRACTIONS
 
@@ -639,7 +659,7 @@ def _build_portfolio_snapshot(display_df: pd.DataFrame) -> pd.DataFrame:
         if condition == "stopped_out":
             remaining = max(0.0, 1.0 - sum(fractions[:targets_hit]))
             if remaining > 0:
-                stop_px = ftm.parse_price(str(r.get("stop", "")), root)
+                stop_px = _parse_price_with_root(r.get("stop", ""), root)
                 if stop_px is None:
                     stop_px = entry
                 if targets_hit >= 1:
@@ -679,7 +699,7 @@ def _build_portfolio_snapshot(display_df: pd.DataFrame) -> pd.DataFrame:
 def _build_trade_action_rows(price_df: pd.DataFrame, row: Dict[str, str], x_col: str) -> List[Dict[str, object]]:
     side = str(row.get("side", "")).upper()
     root = str(row.get("root", ""))
-    entry_value = ftm.parse_price(str(row.get("entry", "")), root)
+    entry_value = _parse_price_with_root(row.get("entry", ""), root)
     if entry_value is None or side not in {"BUY", "SELL", "L", "S"}:
         return []
 
@@ -712,9 +732,9 @@ def _build_trade_action_rows(price_df: pd.DataFrame, row: Dict[str, str], x_col:
         targets_hit = 0
     targets_hit = max(0, min(3, targets_hit))
     target_values = [
-        ftm.parse_price(str(row.get("target1", "")), root),
-        ftm.parse_price(str(row.get("target2", "")), root),
-        ftm.parse_price(str(row.get("target3", "")), root),
+        _parse_price_with_root(row.get("target1", ""), root),
+        _parse_price_with_root(row.get("target2", ""), root),
+        _parse_price_with_root(row.get("target3", ""), root),
     ]
     target_action = "SELL" if is_buy else "BUY"
 
@@ -751,7 +771,7 @@ def _build_trade_action_rows(price_df: pd.DataFrame, row: Dict[str, str], x_col:
 
     condition = str(row.get("condition", ""))
     if condition == "stopped_out":
-        stop_price = ftm.parse_price(str(row.get("stop", "")), root)
+        stop_price = _parse_price_with_root(row.get("stop", ""), root)
         if targets_hit >= 1:
             stop_price = float(entry_value)
 
@@ -795,7 +815,7 @@ def _session_exposure_stats(display_df: pd.DataFrame, mode: str) -> Dict[str, fl
             continue
 
         qty = abs(float(pd.to_numeric(row.get("position", 0), errors="coerce") or 0.0))
-        entry = ftm.parse_price(str(row.get("entry", "")), str(row.get("root", "")))
+        entry = _parse_price_with_root(row.get("entry", ""), row.get("root", ""))
         if qty <= 0 or entry is None:
             continue
         mult = float(CONTRACT_MULTIPLIERS.get(str(row.get("root", "")), 1.0))
@@ -1177,7 +1197,7 @@ def _build_price_levels_chart(bars: pd.DataFrame, row: Dict[str, str]):
 
     level_rows = []
     for _, raw, color, label in level_specs:
-        value = ftm.parse_price(str(raw), str(row.get("root", "")))
+        value = _parse_price_with_root(raw, row.get("root", ""))
         if value is not None:
             level_rows.append({"level": float(value), "label": label, "color": color})
             price_min = min(price_min, float(value))
@@ -1190,7 +1210,7 @@ def _build_price_levels_chart(bars: pd.DataFrame, row: Dict[str, str]):
     marker_layer = None
     side = str(row.get("side", "")).upper()
     root = str(row.get("root", ""))
-    entry_value = ftm.parse_price(str(row.get("entry", "")), root)
+    entry_value = _parse_price_with_root(row.get("entry", ""), root)
     if entry_value is not None and side in {"BUY", "SELL", "L", "S"}:
         is_buy = side in {"BUY", "L"}
         trigger_idx = None
@@ -1217,9 +1237,9 @@ def _build_price_levels_chart(bars: pd.DataFrame, row: Dict[str, str]):
             except ValueError:
                 targets_hit = 0
             target_values = [
-                ftm.parse_price(str(row.get("target1", "")), root),
-                ftm.parse_price(str(row.get("target2", "")), root),
-                ftm.parse_price(str(row.get("target3", "")), root),
+                _parse_price_with_root(row.get("target1", ""), root),
+                _parse_price_with_root(row.get("target2", ""), root),
+                _parse_price_with_root(row.get("target3", ""), root),
             ]
             target_action = "SELL" if is_buy else "BUY"
             last_event_idx = trigger_idx
@@ -1253,7 +1273,7 @@ def _build_price_levels_chart(bars: pd.DataFrame, row: Dict[str, str]):
             # Add stop-out action marker (e.g. short stopped out => BUY stop marker).
             condition = str(row.get("condition", ""))
             if condition == "stopped_out":
-                stop_price = ftm.parse_price(str(row.get("stop", "")), root)
+                stop_price = _parse_price_with_root(row.get("stop", ""), root)
                 if targets_hit >= 1:
                     stop_price = float(entry_value)
 
