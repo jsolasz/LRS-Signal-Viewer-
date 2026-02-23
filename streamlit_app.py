@@ -812,36 +812,6 @@ def _session_exposure_stats(display_df: pd.DataFrame, mode: str) -> Dict[str, fl
     return {"max": max_exp, "current": running_gross, "max_net": max_net}
 
 
-def _render_stat_cards(portfolio_df: pd.DataFrame, exposure_stats: Dict[str, float]) -> None:
-    if portfolio_df.empty:
-        st.info("No triggered trades for portfolio stats yet.")
-        return
-
-    realized_pl = float(portfolio_df["realized_pl"].sum())
-    unrealized_pl = float(portfolio_df["unrealized_pl"].sum())
-    daily_pl = float(portfolio_df["daily_pl"].sum())
-    gross_exposure = float(portfolio_df["notional"].sum())
-    max_exposure = float(exposure_stats.get("max", 0.0))
-    max_net_exposure = float(exposure_stats.get("max_net", 0.0))
-    stop_var_open = float(portfolio_df["stop_var"].sum()) if "stop_var" in portfolio_df.columns else 0.0
-
-    valid_pct = portfolio_df["daily_pl_pct"].dropna()
-    if valid_pct.empty:
-        daily_pl_pct = 0.0
-    else:
-        daily_pl_pct = float(valid_pct.mean())
-
-    c1, c2, c3, c4, c5, c6, c7, c8 = st.columns(8)
-    c1.metric("Daily P/L", _abbr_number(daily_pl))
-    c2.metric("Realized P/L", _abbr_number(realized_pl))
-    c3.metric("Unrealized P/L", _abbr_number(unrealized_pl))
-    c4.metric("Daily P/L %", f"{daily_pl_pct:,.2f}%")
-    c5.metric("Gross Exposure (Now)", _abbr_number(gross_exposure))
-    c6.metric("Max Exposure (Session)", _abbr_number(max_exposure))
-    c7.metric("Max Net Exposure (Session)", _abbr_number(max_net_exposure))
-    c8.metric("VaR to Stops (Open)", _abbr_number(stop_var_open))
-
-
 def _abbr_number(value: float) -> str:
     sign = "-" if value < 0 else ""
     x = abs(float(value))
@@ -852,6 +822,89 @@ def _abbr_number(value: float) -> str:
     if x >= 1_000:
         return f"{sign}{x/1_000:.1f}K"
     return f"{sign}{x:,.2f}"
+
+
+def _value_color(value: float) -> str:
+    if value > 0:
+        return "#22C55E"
+    if value < 0:
+        return "#EF4444"
+    return "#9CA3AF"
+
+
+def _metric_card(label: str, value_text: str, color: str, subtitle: str = "") -> str:
+    subtitle_html = (
+        f'<div style="font-size:11px;color:#6B7280;margin-top:4px;">{subtitle}</div>'
+        if subtitle
+        else ""
+    )
+    return f"""
+    <div style="
+        border:1px solid #1f2937;
+        border-radius:10px;
+        padding:12px 10px;
+        background:#0b1220;
+        min-height:84px;
+    ">
+      <div style="font-size:12px;color:#9CA3AF;margin-bottom:6px;">{label}</div>
+      <div style="font-size:22px;font-weight:700;color:{color};line-height:1.1;">{value_text}</div>
+      {subtitle_html}
+    </div>
+    """
+
+
+def _render_stat_cards(portfolio_df: pd.DataFrame, exposure_stats: Dict[str, float]) -> None:
+    if portfolio_df.empty:
+        st.info("No triggered trades for portfolio stats yet.")
+        return
+
+    realized_pl = float(portfolio_df["realized_pl"].sum())
+    unrealized_pl = float(portfolio_df["unrealized_pl"].sum())
+    daily_pl = float(portfolio_df["daily_pl"].sum())
+    gross_exposure_now = float(portfolio_df["notional"].sum())
+    max_exposure = float(exposure_stats.get("max", 0.0))
+    max_net_exposure = float(exposure_stats.get("max_net", 0.0))
+    stop_var_open = float(portfolio_df["stop_var"].sum()) if "stop_var" in portfolio_df.columns else 0.0
+
+    base = float((portfolio_df["qty"].abs() * portfolio_df["entry_px"] * portfolio_df["multiplier"]).sum())
+    daily_pl_pct = (daily_pl / base * 100.0) if base > 0 else 0.0
+    unrealized_pl_pct = (unrealized_pl / base * 100.0) if base > 0 else 0.0
+    realized_pl_pct = (realized_pl / base * 100.0) if base > 0 else 0.0
+
+    market_value = float((portfolio_df["current_position"] * portfolio_df["market_px"] * portfolio_df["multiplier"]).sum())
+    long_value = float(
+        (portfolio_df.loc[portfolio_df["current_position"] > 0, "current_position"]
+         * portfolio_df.loc[portfolio_df["current_position"] > 0, "market_px"]
+         * portfolio_df.loc[portfolio_df["current_position"] > 0, "multiplier"]).sum()
+    )
+    short_value = float(
+        (portfolio_df.loc[portfolio_df["current_position"] < 0, "current_position"].abs()
+         * portfolio_df.loc[portfolio_df["current_position"] < 0, "market_px"]
+         * portfolio_df.loc[portfolio_df["current_position"] < 0, "multiplier"]).sum()
+    )
+
+    r1 = st.columns(6)
+    r1[0].markdown(_metric_card("Daily P/L USD", _abbr_number(daily_pl), _value_color(daily_pl)), unsafe_allow_html=True)
+    r1[1].markdown(_metric_card("Daily P/L %", f"{daily_pl_pct:,.2f}%", _value_color(daily_pl_pct)), unsafe_allow_html=True)
+    r1[2].markdown(_metric_card("Unrealized P/L USD", _abbr_number(unrealized_pl), _value_color(unrealized_pl)), unsafe_allow_html=True)
+    r1[3].markdown(_metric_card("Unrealized P/L %", f"{unrealized_pl_pct:,.2f}%", _value_color(unrealized_pl_pct)), unsafe_allow_html=True)
+    r1[4].markdown(_metric_card("Realized P/L USD", _abbr_number(realized_pl), _value_color(realized_pl)), unsafe_allow_html=True)
+    r1[5].markdown(_metric_card("Realized P/L %", f"{realized_pl_pct:,.2f}%", _value_color(realized_pl_pct)), unsafe_allow_html=True)
+
+    r2 = st.columns(5)
+    r2[0].markdown(_metric_card("Market Value", _abbr_number(market_value), _value_color(market_value)), unsafe_allow_html=True)
+    r2[1].markdown(_metric_card("Long Value", _abbr_number(long_value), "#22C55E"), unsafe_allow_html=True)
+    r2[2].markdown(_metric_card("Short Value", _abbr_number(short_value), "#EF4444"), unsafe_allow_html=True)
+    r2[3].markdown(
+        _metric_card(
+            "Gross Exposure",
+            f"{_abbr_number(gross_exposure_now)} / {_abbr_number(max_exposure)}",
+            "#60A5FA",
+            "Current / Max (session)",
+        ),
+        unsafe_allow_html=True,
+    )
+    r2[4].markdown(_metric_card("VaR to Stop", _abbr_number(stop_var_open), "#F59E0B"), unsafe_allow_html=True)
 
 
 def _render_portfolio_table(portfolio_df: pd.DataFrame) -> None:
@@ -924,6 +977,11 @@ def _style_table(df: pd.DataFrame):
     return df.style.apply(color_row, axis=1).set_properties(**{"font-size": "14px"})
 
 
+def _table_height(row_count: int, min_rows: int = 15, max_rows: int = 60) -> int:
+    rows = max(min_rows, min(max_rows, int(row_count)))
+    return 42 + (rows * 35)
+
+
 def _table_label(source_file: str) -> str:
     lower = source_file.lower()
     if "global_macro" in lower or "global macro" in lower:
@@ -933,20 +991,55 @@ def _table_label(source_file: str) -> str:
     return source_file
 
 
+def _sort_for_selection(df: pd.DataFrame) -> pd.DataFrame:
+    work = df.copy()
+    triggered_conditions = {"open_after_trigger", "stopped_out", "all_targets_filled"}
+    work["_is_triggered"] = work.get("condition", "").isin(triggered_conditions)
+    work["_state_rank"] = (
+        work.get("state_key", "")
+        .map(
+            {
+                "TRIGGERED": 0,
+                "T1_OPEN": 1,
+                "T2_OPEN": 2,
+                "T1_STOP": 3,
+                "T2_STOP": 4,
+                "STOPPED": 5,
+                "T3_DONE": 6,
+                "WAITING_ENTRY": 7,
+                "NO_DATA": 8,
+                "DORMANT": 9,
+                "INVALID": 10,
+                "UNKNOWN": 11,
+            }
+        )
+        .fillna(99)
+    )
+    work = work.sort_values(
+        by=["_is_triggered", "_state_rank", "source_file", "contract_code", "source_line"],
+        ascending=[False, True, True, True, True],
+    ).drop(columns=["_is_triggered", "_state_rank"])
+    return work.reset_index(drop=True)
+
+
 def _render_section(df_section: pd.DataFrame, section_title: str) -> None:
     st.subheader(section_title)
     counts = df_section["state_label"].value_counts().reset_index()
     counts.columns = ["State", "Count"]
     c1, c2 = st.columns([4, 1.3])
     with c1:
-        st.dataframe(_style_table(df_section), use_container_width=True, height=420)
+        st.dataframe(
+            _style_table(df_section),
+            use_container_width=True,
+            height=_table_height(len(df_section)),
+        )
     with c2:
         st.dataframe(counts, use_container_width=True, height=220)
 
 
 def _render_single_selector(display_df: pd.DataFrame) -> None:
     st.subheader("Trade Selection")
-    selector_df = display_df.copy()
+    selector_df = _sort_for_selection(display_df)
     selector_df["source_group"] = selector_df["source_file"].astype(str).apply(_table_label)
     selector_cols = [
         "trade_id",
