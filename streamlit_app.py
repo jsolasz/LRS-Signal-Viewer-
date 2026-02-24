@@ -44,11 +44,14 @@ ET = ZoneInfo("America/New_York")
 SCRIPT_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = SCRIPT_DIR / ".uploaded_trades"
 UPLOAD_DIR.mkdir(exist_ok=True)
+OPEN_CACHE_PATH = UPLOAD_DIR / ".open_positions_cache.csv"
 SIZE_FRACTIONS = [0.50, 0.25, 0.25]
 CONTRACT_MULTIPLIERS = {
     "ES": 50.0,
     "NQ": 20.0,
+    "MNQ": 2.0,
     "YM": 5.0,
+    "NKD": 5.0,
     "RTY": 50.0,
     "CL": 1000.0,
     "NG": 10000.0,
@@ -79,7 +82,9 @@ CONTRACT_MULTIPLIERS = {
 ASSET_CLASS_BY_ROOT = {
     "ES": "Equity Index",
     "NQ": "Equity Index",
+    "MNQ": "Equity Index",
     "YM": "Equity Index",
+    "NKD": "Equity Index",
     "RTY": "Equity Index",
     "CL": "Energy",
     "NG": "Energy",
@@ -108,6 +113,33 @@ ASSET_CLASS_BY_ROOT = {
     "6S": "FX",
 }
 MASTER_PASSWORD = "NewDay1574!"
+RAW_ROW_COLUMNS = [
+    "source_file",
+    "source_line",
+    "signal_date",
+    "contract_text",
+    "program",
+    "futures_clean",
+    "contract_code",
+    "contract_name",
+    "root",
+    "month_code",
+    "year",
+    "side",
+    "entry",
+    "stop",
+    "target1",
+    "target2",
+    "target3",
+    "status",
+    "is_live",
+    "send_multiplier",
+    "close",
+    "position_raw",
+    "position",
+    "account",
+    "max_hold_date",
+]
 
 
 def _require_password() -> None:
@@ -141,13 +173,28 @@ def _load_rows_from_bytes(file_name: str, raw_bytes: bytes) -> List[Dict[str, st
     reader = csv.DictReader(io.StringIO("\n".join(lines[1:])))
     for idx, raw in enumerate(reader, start=3):
         row = ftm._clean_row(raw)
-        contract_text = row.get("Future (System Direction)", "")
+        contract_text = row.get("Future (System Direction)", "") or row.get("FUTURE", "")
         if not contract_text:
             continue
 
         parsed = ftm.parse_contract(contract_text, reference_year)
+        # Ignore footer/open-position/non-signal rows.
+        if parsed is None:
+            continue
+        if ftm.parse_float(row.get("ENTRY", "")) is None:
+            continue
+        if ftm.parse_float(row.get("STOP", "")) is None:
+            continue
+        if ftm.parse_float(row.get("Target1", "")) is None:
+            continue
+        if ftm.parse_float(row.get("Target2", "")) is None:
+            continue
+        if ftm.parse_float(row.get("Target3", "")) is None:
+            continue
         is_live, send_mult = ftm.parse_status(row.get("STATUS", ""))
         parsed_pos = ftm.parse_position(row.get("Position", ""))
+        parse_program_fn = getattr(ftm, "parse_program", None)
+        program = parse_program_fn(contract_text) if callable(parse_program_fn) else ""
 
         rows.append(
             {
@@ -155,6 +202,7 @@ def _load_rows_from_bytes(file_name: str, raw_bytes: bytes) -> List[Dict[str, st
                 "source_line": str(idx),
                 "signal_date": signal_date,
                 "contract_text": contract_text,
+                "program": program,
                 "futures_clean": ftm.format_futures_clean(parsed),
                 "contract_code": ftm.format_contract_code(parsed),
                 "contract_name": ftm.format_contract_name(parsed),
@@ -178,6 +226,124 @@ def _load_rows_from_bytes(file_name: str, raw_bytes: bytes) -> List[Dict[str, st
             }
         )
     return rows
+
+
+def _strategy_group(source_file: object) -> str:
+    return _table_label(str(source_file or ""))
+
+
+def _position_key(row: Dict[str, object]) -> str:
+    side_raw = str(row.get("side", "")).upper()
+    side_norm = {"BUY": "L", "SELL": "S"}.get(side_raw, side_raw)
+    parts = [
+        _strategy_group(row.get("source_file", "")),
+        str(row.get("account", "")),
+        str(row.get("contract_code", "")),
+        side_norm,
+        str(row.get("entry", "")),
+        str(row.get("stop", "")),
+        str(row.get("target1", "")),
+        str(row.get("target2", "")),
+        str(row.get("target3", "")),
+    ]
+    return "|".join(parts)
+
+
+def _load_open_positions_cache() -> List[Dict[str, str]]:
+    if not OPEN_CACHE_PATH.exists():
+        return []
+    rows: List[Dict[str, str]] = []
+    try:
+        with OPEN_CACHE_PATH.open("r", newline="", encoding="utf-8") as fh:
+            reader = csv.DictReader(fh)
+            for raw in reader:
+                rows.append({k: (v or "") for k, v in raw.items()})
+    except Exception:
+        return []
+    return rows
+
+
+def _merge_with_open_cache(input_rows: List[Dict[str, str]], cached_rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    merged: Dict[str, Dict[str, str]] = {}
+    for row in cached_rows:
+        merged[_position_key(row)] = row
+    for row in input_rows:
+        merged[_position_key(row)] = row
+    return list(merged.values())
+
+
+def _save_open_positions_cache(display_df: pd.DataFrame) -> None:
+    if display_df.empty:
+        OPEN_CACHE_PATH.write_text("", encoding="utf-8")
+        return
+    keep = display_df[
+        (display_df.get("condition", "") == "open_after_trigger")
+        & (pd.to_numeric(display_df.get("current_position", 0), errors="coerce").abs() > 0)
+    ].copy()
+    if keep.empty:
+        OPEN_CACHE_PATH.write_text("", encoding="utf-8")
+        return
+
+    out_rows: List[Dict[str, str]] = []
+    for _, r in keep.iterrows():
+        out_rows.append({col: str(r.get(col, "")) for col in RAW_ROW_COLUMNS})
+
+    dedup: Dict[str, Dict[str, str]] = {}
+    for row in out_rows:
+        dedup[_position_key(row)] = row
+
+    with OPEN_CACHE_PATH.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=RAW_ROW_COLUMNS)
+        writer.writeheader()
+        writer.writerows(list(dedup.values()))
+
+
+def _write_open_positions_cache_rows(rows: List[Dict[str, str]]) -> None:
+    if not rows:
+        OPEN_CACHE_PATH.write_text("", encoding="utf-8")
+        return
+    dedup: Dict[str, Dict[str, str]] = {}
+    for row in rows:
+        normalized = {col: str(row.get(col, "")) for col in RAW_ROW_COLUMNS}
+        dedup[_position_key(normalized)] = normalized
+    with OPEN_CACHE_PATH.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=RAW_ROW_COLUMNS)
+        writer.writeheader()
+        writer.writerows(list(dedup.values()))
+
+
+def _parse_max_hold_cutoff_et(max_hold_date_text: object) -> Optional[datetime]:
+    text = str(max_hold_date_text or "").strip()
+    if not text:
+        return None
+    if " " in text:
+        text = text.split(" ", 1)[0].strip()
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y", "%m/%d/%y", "%m-%d-%y"):
+        try:
+            d = datetime.strptime(text, fmt).date()
+            return datetime.combine(d, time(hour=16, minute=0), tzinfo=ET)
+        except ValueError:
+            continue
+    return None
+
+
+def _close_price_at_or_before_cutoff(
+    bars: Optional[pd.DataFrame], cutoff_et: datetime, fallback_price: Optional[float]
+) -> Optional[float]:
+    if bars is None or bars.empty:
+        return fallback_price
+    try:
+        idx = pd.to_datetime(bars.index)
+        if getattr(idx, "tz", None) is None:
+            idx = idx.tz_localize(ET)
+        else:
+            idx = idx.tz_convert(ET)
+        cutoff_bars = bars.loc[idx <= cutoff_et]
+        if cutoff_bars.empty:
+            return fallback_price
+        return float(cutoff_bars["Close"].iloc[-1])
+    except Exception:
+        return fallback_price
 
 
 def _parse_price_with_root(value: object, root: object) -> Optional[float]:
@@ -295,6 +461,11 @@ def _state_bucket(row: Dict[str, str]) -> Tuple[str, str, str]:
     if condition == "all_targets_filled":
         return ("T3_DONE", "All targets filled", "#1B5E20")
 
+    if condition == "max_hold_closed":
+        if targets_hit <= 0:
+            return ("HOLD_CLOSED", "Max hold close (flat at 4PM)", "#38BDF8")
+        return ("HOLD_CLOSED", "Max hold close after targets", "#0EA5E9")
+
     if condition == "stopped_out":
         if targets_hit <= 0:
             return ("STOPPED", "Triggered, stopped out", "#EF4444")
@@ -324,6 +495,7 @@ def _analyze(
     quote_cache: Dict[str, ftm.QuoteResult] = {}
     history_cache: Dict[str, object] = {}
     output_rows: List[Dict[str, str]] = []
+    now_et = datetime.now(ET)
 
     for row in rows:
         out = dict(row)
@@ -362,6 +534,27 @@ def _analyze(
                 market_price = float(bars["Close"].iloc[-1])
             except Exception:
                 market_price = None
+
+        cutoff_et = _parse_max_hold_cutoff_et(row.get("max_hold_date", ""))
+        if cutoff_et is not None and now_et >= cutoff_et and state.condition == "open_after_trigger":
+            forced_exit_px = _close_price_at_or_before_cutoff(bars, cutoff_et, market_price)
+            if forced_exit_px is not None:
+                market_price = float(forced_exit_px)
+            prior_notes = state.notes or ""
+            forced_note = f"Max hold close executed at 4:00 PM ET on {cutoff_et.strftime('%Y-%m-%d')}."
+            if forced_exit_px is not None:
+                forced_note = f"{forced_note} Exit px {forced_exit_px:.6g}."
+            merged_notes = f"{prior_notes} | {forced_note}" if prior_notes else forced_note
+            state = ftm.TradeState(
+                condition="max_hold_closed",
+                notes=merged_notes,
+                working_stop_price=None,
+                working_stop_size=0.0,
+                next_target=None,
+                next_target_price=None,
+                remaining_size=0.0,
+                targets_hit=state.targets_hit,
+            )
 
         out["history_symbol"] = history_symbol
         out["condition"] = state.condition
@@ -437,6 +630,7 @@ def _analyze(
         "state_label",
         "contract_name",
         "contract_code",
+        "program",
         "side",
         "status",
         "position",
@@ -602,7 +796,7 @@ def _build_portfolio_snapshot(display_df: pd.DataFrame) -> pd.DataFrame:
             * df.loc[is_sell, "multiplier"]
         )
 
-    triggered_conditions = {"open_after_trigger", "stopped_out", "all_targets_filled"}
+    triggered_conditions = {"open_after_trigger", "stopped_out", "all_targets_filled", "max_hold_closed"}
     df = df[df["condition"].isin(triggered_conditions)].copy()
     if df.empty:
         return df
@@ -656,15 +850,22 @@ def _build_portfolio_snapshot(display_df: pd.DataFrame) -> pd.DataFrame:
             realized += qty * fractions[i] * direction * (float(t_vals[i]) - entry) * mult
 
         condition = str(r.get("condition", ""))
-        if condition == "stopped_out":
+        if condition in {"stopped_out", "max_hold_closed"}:
             remaining = max(0.0, 1.0 - sum(fractions[:targets_hit]))
             if remaining > 0:
-                stop_px = _parse_price_with_root(r.get("stop", ""), root)
-                if stop_px is None:
-                    stop_px = entry
-                if targets_hit >= 1:
-                    stop_px = entry
-                realized += qty * remaining * direction * (float(stop_px) - entry) * mult
+                exit_px = None
+                if condition == "max_hold_closed":
+                    try:
+                        exit_px = float(r.get("market_px", entry))
+                    except Exception:
+                        exit_px = entry
+                else:
+                    exit_px = _parse_price_with_root(r.get("stop", ""), root)
+                    if exit_px is None:
+                        exit_px = entry
+                    if targets_hit >= 1:
+                        exit_px = entry
+                realized += qty * remaining * direction * (float(exit_px) - entry) * mult
         return realized
 
     df["realized_pl"] = df.apply(_realized_row, axis=1)
@@ -672,6 +873,8 @@ def _build_portfolio_snapshot(display_df: pd.DataFrame) -> pd.DataFrame:
     df["daily_pl"] = df["realized_pl"] + df["unrealized_pl"]
     base = (df["qty"].abs() * df["entry_px"] * df["multiplier"]).replace(0, pd.NA)
     df["daily_pl_pct"] = (df["daily_pl"] / base) * 100.0
+    df["unrealized_pl_pct"] = (df["unrealized_pl"] / base) * 100.0
+    df["realized_pl_pct"] = (df["realized_pl"] / base) * 100.0
     df["notional"] = (df["current_position"].abs() * df["market_px"] * df["multiplier"]).fillna(0.0)
 
     # Stop-based VaR for open positions only (with stop moved to entry after T1+).
@@ -797,6 +1000,34 @@ def _build_trade_action_rows(price_df: pd.DataFrame, row: Dict[str, str], x_col:
                         "remaining_after": 0.0,
                     }
                 )
+    elif condition == "max_hold_closed":
+        close_price = _parse_price_with_root(row.get("market_price", ""), root)
+        if close_price is None:
+            close_price = _parse_price_with_root(row.get("quote_price", ""), root)
+        if close_price is None:
+            close_price = float(price_df.iloc[-1]["Close"])
+        close_idx = len(price_df) - 1
+        cutoff_et = _parse_max_hold_cutoff_et(row.get("max_hold_date", ""))
+        if cutoff_et is not None:
+            for j in range(last_event_idx + 1, len(price_df)):
+                ts = pd.Timestamp(price_df.iloc[j][x_col])
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize(ET)
+                else:
+                    ts = ts.tz_convert(ET)
+                if ts >= cutoff_et:
+                    close_idx = j
+                    break
+        rows.append(
+            {
+                "idx": close_idx,
+                "ts": price_df.iloc[close_idx][x_col],
+                "px": float(close_price),
+                "dir": "SELL" if is_buy else "BUY",
+                "event": "Max Hold Close",
+                "remaining_after": 0.0,
+            }
+        )
 
     return rows
 
@@ -807,7 +1038,7 @@ def _session_exposure_stats(display_df: pd.DataFrame, mode: str) -> Dict[str, fl
 
     history_cache: Dict[str, object] = {}
     events: List[Tuple[pd.Timestamp, float, float]] = []
-    triggered_conditions = {"open_after_trigger", "stopped_out", "all_targets_filled"}
+    triggered_conditions = {"open_after_trigger", "stopped_out", "all_targets_filled", "max_hold_closed"}
 
     for _, r in display_df.iterrows():
         row = r.to_dict()
@@ -951,35 +1182,132 @@ def _render_stat_cards(portfolio_df: pd.DataFrame, exposure_stats: Dict[str, flo
     r2[4].markdown(_metric_card("VaR to Stop", _abbr_number(stop_var_open), "#F59E0B"), unsafe_allow_html=True)
 
 
+def _render_program_stats(portfolio_df: pd.DataFrame) -> None:
+    st.subheader("Performance by Program")
+    if portfolio_df.empty:
+        st.info("No triggered trades for program stats yet.")
+        return
+
+    work = portfolio_df.copy()
+    work["program_group"] = work.get("source_file", "").astype(str).apply(_table_label)
+    for col in ["daily_pl", "realized_pl", "unrealized_pl", "stop_var", "notional"]:
+        if col not in work.columns:
+            work[col] = 0.0
+
+    grouped = (
+        work.groupby("program_group", as_index=False)
+        .agg(
+            daily_pl=("daily_pl", "sum"),
+            realized_pl=("realized_pl", "sum"),
+            unrealized_pl=("unrealized_pl", "sum"),
+            var_to_stop=("stop_var", "sum"),
+            gross_exposure=("notional", "sum"),
+            trades=("trade_id", "count"),
+        )
+        .sort_values("program_group")
+    )
+    for _, r in grouped.iterrows():
+        program = str(r.get("program_group", ""))
+        daily_pl = float(r.get("daily_pl", 0.0))
+        unrealized_pl = float(r.get("unrealized_pl", 0.0))
+        realized_pl = float(r.get("realized_pl", 0.0))
+        var_to_stop = float(r.get("var_to_stop", 0.0))
+        gross_exposure = float(r.get("gross_exposure", 0.0))
+        trades = int(float(r.get("trades", 0)))
+
+        st.markdown(f"**{program}**")
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.markdown(_metric_card("Daily P/L", f"${daily_pl:,.2f}", _value_color(daily_pl), f"{trades} trade(s)"), unsafe_allow_html=True)
+        c2.markdown(_metric_card("Unrealized P/L", f"${unrealized_pl:,.2f}", _value_color(unrealized_pl)), unsafe_allow_html=True)
+        c3.markdown(_metric_card("Realized P/L", f"${realized_pl:,.2f}", _value_color(realized_pl)), unsafe_allow_html=True)
+        c4.markdown(_metric_card("VaR to Stop", f"${var_to_stop:,.2f}", "#F59E0B"), unsafe_allow_html=True)
+        c5.markdown(_metric_card("Gross Exposure", f"${gross_exposure:,.2f}", "#60A5FA"), unsafe_allow_html=True)
+
+
 def _render_portfolio_table(portfolio_df: pd.DataFrame) -> None:
     st.subheader("Portfolio Snapshot (Triggered Trades)")
     if portfolio_df.empty:
         st.info("No triggered trades available.")
         return
 
+    work = portfolio_df.copy()
+    if "program" not in work.columns:
+        work["program"] = ""
+    if "current_position" not in work.columns:
+        work["current_position"] = pd.to_numeric(work.get("position", 0), errors="coerce").fillna(0.0)
+    if "realized_pl" not in work.columns:
+        work["realized_pl"] = 0.0
+    if "unrealized_pl" not in work.columns:
+        work["unrealized_pl"] = 0.0
+    if "daily_pl" not in work.columns:
+        work["daily_pl"] = pd.to_numeric(work.get("realized_pl", 0), errors="coerce").fillna(0.0) + pd.to_numeric(
+            work.get("unrealized_pl", 0), errors="coerce"
+        ).fillna(0.0)
+    if "daily_pl_pct" not in work.columns:
+        base = (
+            pd.to_numeric(work.get("position", 0), errors="coerce").abs().fillna(0.0)
+            * pd.to_numeric(work.get("entry_px", work.get("entry", 0)), errors="coerce").fillna(0.0)
+            * pd.to_numeric(work.get("multiplier", 1.0), errors="coerce").fillna(1.0)
+        ).replace(0, pd.NA)
+        work["daily_pl_pct"] = (pd.to_numeric(work.get("daily_pl", 0), errors="coerce").fillna(0.0) / base) * 100.0
+        work["unrealized_pl_pct"] = (pd.to_numeric(work.get("unrealized_pl", 0), errors="coerce").fillna(0.0) / base) * 100.0
+        work["realized_pl_pct"] = (pd.to_numeric(work.get("realized_pl", 0), errors="coerce").fillna(0.0) / base) * 100.0
+    if "unrealized_pl_pct" not in work.columns:
+        work["unrealized_pl_pct"] = 0.0
+    if "realized_pl_pct" not in work.columns:
+        work["realized_pl_pct"] = 0.0
+    if "state_label" not in work.columns:
+        work["state_label"] = work.get("condition", "").astype(str)
+    if "contract_code" not in work.columns:
+        work["contract_code"] = ""
+    if "notes" not in work.columns:
+        work["notes"] = ""
+    if "side" not in work.columns:
+        work["side"] = ""
+    if "source_file" not in work.columns:
+        work["source_file"] = ""
+    if "max_risk" not in work.columns:
+        work["max_risk"] = 0.0
+    if "max_reward" not in work.columns:
+        work["max_reward"] = 0.0
+    if "stop_var" not in work.columns:
+        work["stop_var"] = 0.0
+    if "multiplier" not in work.columns:
+        work["multiplier"] = 1.0
+    if "entry_px" not in work.columns:
+        work["entry_px"] = pd.to_numeric(work.get("entry", 0), errors="coerce").fillna(0.0)
+    if "market_px" not in work.columns:
+        work["market_px"] = pd.to_numeric(work.get("market_price", work.get("quote_price", 0)), errors="coerce").fillna(0.0)
+    if "session_open_px" not in work.columns:
+        work["session_open_px"] = pd.to_numeric(work.get("session_open_price", 0), errors="coerce").fillna(0.0)
+
     table_cols = [
-        "source_file",
+        "program",
         "contract_code",
-        "side",
+        "current_position",
+        "daily_pl",
+        "daily_pl_pct",
+        "unrealized_pl",
+        "unrealized_pl_pct",
+        "realized_pl",
+        "realized_pl_pct",
         "state_label",
+        "side",
         "max_risk",
         "max_reward",
         "stop_var",
         "multiplier",
-        "current_position",
         "entry_px",
         "market_px",
         "session_open_px",
-        "realized_pl",
-        "unrealized_pl",
-        "daily_pl",
-        "daily_pl_pct",
+        "source_file",
         "notes",
     ]
-    show = portfolio_df[[c for c in table_cols if c in portfolio_df.columns]].copy()
+    show = work[table_cols].copy()
     rename = {
         "source_file": "book",
         "contract_code": "contract",
+        "program": "program",
         "state_label": "state",
         "max_risk": "max_risk",
         "max_reward": "max_reward",
@@ -991,11 +1319,201 @@ def _render_portfolio_table(portfolio_df: pd.DataFrame) -> None:
         "session_open_px": "session_open",
         "realized_pl": "realized_pl",
         "unrealized_pl": "unrealized_pl",
+        "unrealized_pl_pct": "unrealized_pl_%",
+        "realized_pl_pct": "realized_pl_%",
         "daily_pl": "daily_pl",
         "daily_pl_pct": "daily_pl_%",
     }
     show = show.rename(columns=rename)
-    st.dataframe(show, use_container_width=True, height=260, hide_index=True)
+    state_color_map = work.get("state_color", pd.Series(["#E5E7EB"] * len(work), index=work.index)).to_dict()
+    state_key_map = work.get("state_key", pd.Series(["UNKNOWN"] * len(work), index=work.index)).to_dict()
+    dark_text_states = {
+        "WAITING_ENTRY",
+        "TRIGGERED",
+        "T1_OPEN",
+        "HOLD_CLOSED",
+        "NO_DATA",
+        "DORMANT",
+        "UNKNOWN",
+    }
+
+    def _portfolio_row_style(row: pd.Series):
+        styles = [""] * len(row)
+        # Match signal-viewer state coloring for the State column.
+        if "state" in row.index:
+            i = row.index.get_loc("state")
+            bg = state_color_map.get(row.name, "#E5E7EB")
+            state_key = str(state_key_map.get(row.name, "UNKNOWN"))
+            fg = "#111827" if state_key in dark_text_states else "#FFFFFF"
+            styles[i] = f"background-color: {bg}; color: {fg}; font-weight: 700;"
+
+        # P/L color coding: green positive, red negative, gray zero.
+        for col in ["daily_pl", "daily_pl_%", "unrealized_pl", "unrealized_pl_%", "realized_pl", "realized_pl_%"]:
+            if col not in row.index:
+                continue
+            i = row.index.get_loc(col)
+            val = pd.to_numeric(row[col], errors="coerce")
+            if pd.isna(val):
+                continue
+            color = "#22C55E" if val > 0 else ("#EF4444" if val < 0 else "#9CA3AF")
+            styles[i] = f"color: {color}; font-weight: 700;"
+        return styles
+
+    def _fmt_usd(v: object) -> str:
+        num = pd.to_numeric(v, errors="coerce")
+        if pd.isna(num):
+            return ""
+        return f"${float(num):,.2f}"
+
+    def _fmt_pct(v: object) -> str:
+        num = pd.to_numeric(v, errors="coerce")
+        if pd.isna(num):
+            return ""
+        return f"{float(num):,.2f}%"
+
+    formatters = {
+        "daily_pl": _fmt_usd,
+        "unrealized_pl": _fmt_usd,
+        "realized_pl": _fmt_usd,
+        "max_risk": _fmt_usd,
+        "max_reward": _fmt_usd,
+        "var_to_stop": _fmt_usd,
+        "entry": _fmt_usd,
+        "current_price": _fmt_usd,
+        "session_open": _fmt_usd,
+        "daily_pl_%": _fmt_pct,
+        "unrealized_pl_%": _fmt_pct,
+        "realized_pl_%": _fmt_pct,
+        "current_position": "{:,.2f}",
+        "multiplier": "{:,.2f}",
+    }
+    applicable_formatters = {k: v for k, v in formatters.items() if k in show.columns}
+
+    st.dataframe(
+        show.style.apply(_portfolio_row_style, axis=1).format(applicable_formatters).set_properties(**{"font-size": "14px"}),
+        use_container_width=True,
+        height=260,
+        hide_index=True,
+    )
+
+
+def _render_var_to_stop_tab(portfolio_df: pd.DataFrame) -> None:
+    st.subheader("VaR to Stop")
+
+    if portfolio_df.empty:
+        st.info("No triggered trades available.")
+        return
+
+    open_df = portfolio_df[
+        (portfolio_df.get("condition", "") == "open_after_trigger")
+        & (portfolio_df.get("current_position", 0).abs() > 0)
+    ].copy()
+
+    if open_df.empty:
+        st.info("No open positions currently.")
+        return
+
+    total_var = float(open_df["stop_var"].sum())
+    long_var = float(open_df.loc[open_df["current_position"] > 0, "stop_var"].sum())
+    short_var = float(open_df.loc[open_df["current_position"] < 0, "stop_var"].sum())
+    gross_now = float(open_df["notional"].sum())
+    var_pct_gross = (total_var / gross_now * 100.0) if gross_now > 0 else 0.0
+    top_var = float(open_df["stop_var"].max()) if len(open_df) else 0.0
+    top_var_pct = (top_var / total_var * 100.0) if total_var > 0 else 0.0
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.markdown(_metric_card("Total VaR to Stop", _abbr_number(total_var), "#F59E0B"), unsafe_allow_html=True)
+    c2.markdown(_metric_card("Long VaR", _abbr_number(long_var), "#22C55E"), unsafe_allow_html=True)
+    c3.markdown(_metric_card("Short VaR", _abbr_number(short_var), "#EF4444"), unsafe_allow_html=True)
+    c4.markdown(_metric_card("VaR / Gross Exposure", f"{var_pct_gross:,.2f}%", "#60A5FA"), unsafe_allow_html=True)
+    c5.markdown(
+        _metric_card("Top Position VaR", _abbr_number(top_var), "#F59E0B", f"{top_var_pct:,.1f}% of total VaR"),
+        unsafe_allow_html=True,
+    )
+
+    open_df["source_group"] = open_df["source_file"].astype(str).apply(_table_label)
+    table_cols = [
+        "source_file",
+        "contract_code",
+        "program",
+        "side",
+        "state_label",
+        "current_position",
+        "market_px",
+        "effective_stop_px",
+        "stop_var",
+        "notional",
+        "daily_pl",
+        "notes",
+    ]
+    show_cols = [c for c in table_cols if c in open_df.columns]
+
+    for book_name in ["Global Macro", "IntradayPlus"]:
+        subset = open_df[open_df["source_group"] == book_name].copy()
+        st.markdown(f"**{book_name}**")
+        if subset.empty:
+            st.caption("No open positions.")
+            continue
+        subset = subset.sort_values("stop_var", ascending=False)
+        st.dataframe(
+            subset[show_cols],
+            use_container_width=True,
+            hide_index=True,
+            height=_table_height(len(subset), min_rows=8, max_rows=30),
+        )
+
+
+def _render_portfolio_admin_tab() -> None:
+    st.subheader("Portfolio Admin")
+    st.caption("Delete selected cached open positions without clearing all uploaded files.")
+    cached_rows = _load_open_positions_cache()
+    if not cached_rows:
+        st.info("No cached open positions.")
+        return
+
+    cache_df = pd.DataFrame(cached_rows)
+    if cache_df.empty:
+        st.info("No cached open positions.")
+        return
+
+    cache_df = cache_df.copy()
+    cache_df["cache_id"] = cache_df.apply(lambda r: _position_key(r.to_dict()), axis=1)
+    show_cols = [
+        "cache_id",
+        "source_file",
+        "contract_code",
+        "program",
+        "side",
+        "position",
+        "entry",
+        "stop",
+        "max_hold_date",
+        "source_line",
+    ]
+    show_cols = [c for c in show_cols if c in cache_df.columns]
+    selected = st.dataframe(
+        cache_df[show_cols],
+        use_container_width=True,
+        hide_index=True,
+        height=_table_height(len(cache_df), min_rows=8, max_rows=25),
+        on_select="rerun",
+        selection_mode="multi-row",
+        key="tbl_cache_delete_select",
+        column_config={"cache_id": None},
+    )
+    picked_rows: List[int] = []
+    if selected and selected.selection and selected.selection.rows:
+        picked_rows = [int(i) for i in selected.selection.rows]
+
+    if st.button("Delete selected cached positions"):
+        if not picked_rows:
+            st.warning("Select one or more rows to delete.")
+            return
+        remove_ids = set(cache_df.iloc[picked_rows]["cache_id"].astype(str).tolist())
+        remaining = [r for r in cached_rows if _position_key(r) not in remove_ids]
+        _write_open_positions_cache_rows(remaining)
+        st.success(f"Deleted {len(remove_ids)} cached position(s).")
+        st.rerun()
 
 
 def _style_table(df: pd.DataFrame):
@@ -1006,6 +1524,7 @@ def _style_table(df: pd.DataFrame):
         "WAITING_ENTRY",
         "TRIGGERED",
         "T1_OPEN",
+        "HOLD_CLOSED",
         "NO_DATA",
         "DORMANT",
         "UNKNOWN",
@@ -1030,14 +1549,31 @@ def _table_label(source_file: str) -> str:
     lower = source_file.lower()
     if "global_macro" in lower or "global macro" in lower:
         return "Global Macro"
+    if lower in {"eq.csv", "eq"}:
+        return "Global Macro"
     if "eqint" in lower:
         return "IntradayPlus"
     return source_file
 
 
+def _sort_by_sheet_order(df: pd.DataFrame, file_order: List[str]) -> pd.DataFrame:
+    if df.empty:
+        return df
+    work = df.copy()
+    order_map = {name: idx for idx, name in enumerate(file_order)}
+    work["_file_rank"] = work.get("source_file", "").astype(str).map(order_map).fillna(len(order_map)).astype(int)
+    work["_line_rank"] = pd.to_numeric(work.get("source_line", ""), errors="coerce").fillna(10**9).astype(int)
+    work = work.sort_values(
+        by=["_file_rank", "_line_rank", "contract_code"],
+        ascending=[True, True, True],
+        kind="stable",
+    ).drop(columns=["_file_rank", "_line_rank"])
+    return work.reset_index(drop=True)
+
+
 def _sort_for_selection(df: pd.DataFrame) -> pd.DataFrame:
     work = df.copy()
-    triggered_conditions = {"open_after_trigger", "stopped_out", "all_targets_filled"}
+    triggered_conditions = {"open_after_trigger", "stopped_out", "all_targets_filled", "max_hold_closed"}
     work["_is_triggered"] = work.get("condition", "").isin(triggered_conditions)
     work["_state_rank"] = (
         work.get("state_key", "")
@@ -1049,12 +1585,13 @@ def _sort_for_selection(df: pd.DataFrame) -> pd.DataFrame:
                 "T1_STOP": 3,
                 "T2_STOP": 4,
                 "STOPPED": 5,
-                "T3_DONE": 6,
-                "WAITING_ENTRY": 7,
-                "NO_DATA": 8,
-                "DORMANT": 9,
-                "INVALID": 10,
-                "UNKNOWN": 11,
+                "HOLD_CLOSED": 6,
+                "T3_DONE": 7,
+                "WAITING_ENTRY": 8,
+                "NO_DATA": 9,
+                "DORMANT": 10,
+                "INVALID": 11,
+                "UNKNOWN": 12,
             }
         )
         .fillna(99)
@@ -1089,6 +1626,7 @@ def _render_single_selector(display_df: pd.DataFrame) -> None:
         "trade_id",
         "source_group",
         "contract_code",
+        "program",
         "side",
         "state_label",
         "condition",
@@ -1123,8 +1661,11 @@ def _df_signature(df: pd.DataFrame) -> str:
 
 def _session_window_et() -> Tuple[datetime, datetime]:
     now_et = datetime.now(ET)
-    yesterday_et = (now_et - timedelta(days=1)).date()
-    start_et = datetime.combine(yesterday_et, time(hour=18, minute=0), tzinfo=ET)
+    today_open = datetime.combine(now_et.date(), time(hour=18, minute=0), tzinfo=ET)
+    if now_et >= today_open:
+        start_et = today_open
+    else:
+        start_et = today_open - timedelta(days=1)
     return start_et, now_et
 
 
@@ -1182,16 +1723,31 @@ def _choose_history_live_window(row: Dict[str, str], mode: str, history_cache: D
     return "", None, last_error
 
 
-def _build_price_levels_chart(bars: pd.DataFrame, row: Dict[str, str]):
+def _build_price_levels_chart(
+    bars: pd.DataFrame,
+    row: Dict[str, str],
+    window_start: Optional[datetime] = None,
+    window_end: Optional[datetime] = None,
+):
     price_df = bars.reset_index().copy()
     x_col = price_df.columns[0]
     price_min = float(price_df["Low"].min())
     price_max = float(price_df["High"].max())
+    x_scale = None
+    if window_start is not None and window_end is not None:
+        ws = pd.Timestamp(window_start)
+        we = pd.Timestamp(window_end)
+        if ws.tz is not None:
+            ws = ws.tz_localize(None)
+        if we.tz is not None:
+            we = we.tz_localize(None)
+        x_scale = alt.Scale(domain=[ws.to_pydatetime(), we.to_pydatetime()], nice=False)
+    x_enc = alt.X(f"{x_col}:T", title="Time", scale=x_scale)
     line = (
         alt.Chart(price_df)
         .mark_line(color="#60A5FA")
         .encode(
-            x=alt.X(f"{x_col}:T", title="Time"),
+            x=x_enc,
             y=alt.Y("Close:Q", title="Price"),
             tooltip=[
                 alt.Tooltip(f"{x_col}:T"),
@@ -1324,9 +1880,9 @@ def _build_price_levels_chart(bars: pd.DataFrame, row: Dict[str, str]):
             if not buy_df.empty:
                 layers.append(
                     alt.Chart(buy_df)
-                    .mark_point(shape="triangle-up", size=260, filled=True, color="#2563EB")
+                    .mark_point(shape="triangle-up", size=260, filled=True, color="#22C55E", stroke="#FFFFFF", strokeWidth=1.8)
                     .encode(
-                        x=alt.X("ts:T"),
+                        x=alt.X("ts:T", scale=x_scale),
                         y=alt.Y("px:Q", scale=y_scale),
                         tooltip=[alt.Tooltip("event:N"), alt.Tooltip("dir:N"), alt.Tooltip("px:Q"), alt.Tooltip("ts:T")],
                     )
@@ -1334,9 +1890,9 @@ def _build_price_levels_chart(bars: pd.DataFrame, row: Dict[str, str]):
             if not sell_df.empty:
                 layers.append(
                     alt.Chart(sell_df)
-                    .mark_point(shape="triangle-down", size=260, filled=True, color="#DC2626")
+                    .mark_point(shape="triangle-down", size=260, filled=True, color="#DC2626", stroke="#FFFFFF", strokeWidth=1.8)
                     .encode(
-                        x=alt.X("ts:T"),
+                        x=alt.X("ts:T", scale=x_scale),
                         y=alt.Y("px:Q", scale=y_scale),
                         tooltip=[alt.Tooltip("event:N"), alt.Tooltip("dir:N"), alt.Tooltip("px:Q"), alt.Tooltip("ts:T")],
                     )
@@ -1380,6 +1936,7 @@ def main() -> None:
     st.caption("Live table of trade states with entry/target/stop progression")
     start_et, end_et = _session_window_et()
     st.caption(f"Evaluation window: {start_et.strftime('%Y-%m-%d %I:%M %p ET')} to {end_et.strftime('%Y-%m-%d %I:%M %p ET')}")
+    existing_uploaded_files = sorted(UPLOAD_DIR.glob("*.csv"))
 
     with st.sidebar:
         st.header("Controls")
@@ -1388,9 +1945,17 @@ def main() -> None:
         live_only = st.checkbox("Live only (Send x)", value=True)
         include_quotes = st.checkbox("Include latest quote", value=False)
         auto_refresh = st.checkbox("Enable auto refresh", value=False)
-        refresh_seconds = st.slider("Refresh seconds", min_value=5, max_value=120, value=20, step=5)
+        refresh_minutes = st.slider("Refresh minutes", min_value=1, max_value=60, value=5, step=1)
         manual_refresh = st.button("Refresh now")
         clear_files = st.button("Clear uploaded files")
+        st.caption("Delete individual uploaded file")
+        delete_target = st.selectbox(
+            "Select file to delete",
+            options=[""] + [p.name for p in existing_uploaded_files],
+            format_func=lambda x: x if x else "-- choose file --",
+            key="delete_target_file",
+        )
+        delete_selected_file = st.button("Delete selected file", disabled=(delete_target == ""))
 
     if manual_refresh:
         st.rerun()
@@ -1405,7 +1970,15 @@ def main() -> None:
     if clear_files:
         for p in UPLOAD_DIR.glob("*.csv"):
             p.unlink(missing_ok=True)
+        OPEN_CACHE_PATH.unlink(missing_ok=True)
         st.success("Cleared saved uploaded files.")
+        st.rerun()
+
+    if delete_selected_file and delete_target:
+        target_path = UPLOAD_DIR / delete_target
+        target_path.unlink(missing_ok=True)
+        st.success(f"Deleted uploaded file: {delete_target}")
+        st.rerun()
 
     if uploaded_files:
         saved_paths = _save_uploaded_files(uploaded_files)
@@ -1418,9 +1991,13 @@ def main() -> None:
 
     st.caption("Using uploaded files: " + ", ".join(p.name for p in saved_paths))
     input_rows = _load_rows_from_saved_files(saved_paths)
+    cached_open_rows = _load_open_positions_cache()
+    if cached_open_rows:
+        input_rows = _merge_with_open_cache(input_rows, cached_open_rows)
+        st.caption(f"Including {len(cached_open_rows)} open cached position(s) from prior sessions.")
 
     if auto_refresh and HAS_ST_AUTOREFRESH:
-        st_autorefresh(interval=refresh_seconds * 1000, key="trade_table_refresh")
+        st_autorefresh(interval=refresh_minutes * 60 * 1000, key="trade_table_refresh")
     elif auto_refresh and not HAS_ST_AUTOREFRESH:
         st.info("Install `streamlit-autorefresh` for smooth in-app refresh (no page blink): `pip install streamlit-autorefresh`")
 
@@ -1431,6 +2008,7 @@ def main() -> None:
         live_only=live_only,
         include_quotes=include_quotes,
     )
+    df = _sort_by_sheet_order(df, [p.name for p in saved_paths])
 
     if df.empty:
         st.warning("No trades found in uploaded files (or no US contracts matched).")
@@ -1458,17 +2036,19 @@ def main() -> None:
 
     portfolio_df = _build_portfolio_snapshot(display_df.reset_index(drop=True))
     exposure_stats = _session_exposure_stats(display_df.reset_index(drop=True), mode)
-    tab_live, tab_risk = st.tabs(["Live Monitor", "Pre-Trade Risk"])
+    _save_open_positions_cache(portfolio_df)
+    tab_live, tab_var, tab_risk, tab_admin = st.tabs(["Live Monitor", "VaR to Stop", "Pre-Trade Risk", "Portfolio Admin"])
 
     with tab_live:
         st.subheader("Portfolio Stats")
         _render_stat_cards(portfolio_df, exposure_stats)
+        _render_program_stats(portfolio_df)
         _render_portfolio_table(portfolio_df)
 
         if "source_file" not in display_df.columns:
             _render_section(display_df.reset_index(drop=True), "All Trades")
         else:
-            for source_file, section in display_df.groupby("source_file", sort=True):
+            for source_file, section in display_df.groupby("source_file", sort=False):
                 _render_section(section.reset_index(drop=True), _table_label(str(source_file)))
 
         st.subheader("Color Legend")
@@ -1481,6 +2061,7 @@ def main() -> None:
                 {"State": "All targets filled", "Color": "Darkest Green"},
                 {"State": "Triggered, stopped out", "Color": "Red"},
                 {"State": "Target1/2 hit, then stopped at entry", "Color": "Orange"},
+                {"State": "Max hold close at 4PM ET", "Color": "Blue"},
                 {"State": "Live (no market data)", "Color": "Light Gray"},
             ]
         )
@@ -1520,7 +2101,10 @@ def main() -> None:
                     )
             except Exception:
                 pass
-            st.altair_chart(_build_price_levels_chart(bars, selected_row), use_container_width=True)
+            st.altair_chart(
+                _build_price_levels_chart(bars, selected_row, start_et, end_et),
+                use_container_width=True,
+            )
 
         detail_cols = [
             "state_label",
@@ -1544,6 +2128,12 @@ def main() -> None:
 
     with tab_risk:
         _render_outcome_scenarios(display_df.reset_index(drop=True))
+
+    with tab_var:
+        _render_var_to_stop_tab(portfolio_df)
+
+    with tab_admin:
+        _render_portfolio_admin_tab()
 
 
 if __name__ == "__main__":

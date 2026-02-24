@@ -44,7 +44,9 @@ SIDE_RE = re.compile(r"\(([^(]*)\)")
 US_CONTINUOUS_SYMBOLS: Dict[str, str] = {
     "ES": "ES=F",
     "NQ": "NQ=F",
+    "MNQ": "MNQ=F",
     "YM": "YM=F",
+    "NKD": "NKD=F",
     "RTY": "RTY=F",
     "CL": "CL=F",
     "NG": "NG=F",
@@ -76,7 +78,9 @@ US_CONTINUOUS_SYMBOLS: Dict[str, str] = {
 US_EXCHANGE_SUFFIXES: Dict[str, List[str]] = {
     "ES": [".CME"],
     "NQ": [".CME"],
+    "MNQ": [".CME"],
     "YM": [".CBT", ".CME"],
+    "NKD": [".CME"],
     "RTY": [".CME"],
     "CL": [".NYM"],
     "NG": [".NYM"],
@@ -103,6 +107,13 @@ US_EXCHANGE_SUFFIXES: Dict[str, List[str]] = {
     "6C": [".CME"],
     "6A": [".CME"],
     "6S": [".CME"],
+}
+
+CONTINUOUS_SYMBOL_CANDIDATES: Dict[str, List[str]] = {
+    # If MNQ is not available from source, fall back to NQ for market data.
+    "MNQ": ["MNQ=F", "NQ=F"],
+    # Nikkei aliases vary by source availability.
+    "NKD": ["NKD=F", "NIY=F", "N225=F"],
 }
 
 MONTH_CODE_TO_NAME: Dict[str, str] = {
@@ -182,12 +193,15 @@ def parse_price(text: str, root: Optional[str] = None) -> Optional[float]:
 
     # 32nds encoding support for CBOT rates where levels are in 1/32 increments.
     if (root or "").upper() in {"ZN", "ZB"}:
-        match = re.fullmatch(r"\s*([+-]?\d+)\.(\d{3})\s*", v)
+        # Accept both:
+        # - 3-digit tenths-of-32nds (e.g. 113.145 -> 14.5/32)
+        # - 2-digit whole 32nds (e.g. 118.11 -> 11/32)
+        match = re.fullmatch(r"\s*([+-]?\d+)\.(\d{2,3})\s*", v)
         if match:
             whole_text, frac_text = match.groups()
             try:
                 whole = int(whole_text)
-                frac_32 = int(frac_text) / 10.0
+                frac_32 = int(frac_text) / 10.0 if len(frac_text) == 3 else float(int(frac_text))
                 sign = -1.0 if whole < 0 else 1.0
                 return float(whole) + sign * (frac_32 / 32.0)
             except ValueError:
@@ -265,8 +279,17 @@ def parse_side(contract_text: str) -> Optional[str]:
     if not block:
         return None
     inner = block.group(1)
-    match = re.search(r"\b([LS])\d+\b", inner)
+    # Supports L1/S1 and LM/SM tags.
+    match = re.search(r"\b([LS])(?:\d+|M)\b", inner)
     return match.group(1) if match else None
+
+
+def parse_program(contract_text: str) -> str:
+    block = SIDE_RE.search(contract_text)
+    if not block:
+        return ""
+    # Normalize "INT+ L1" -> "INT+L1", keep variants like "L1", "SM".
+    return re.sub(r"\s+", "", block.group(1).strip())
 
 
 def parse_file_date(metadata: str) -> Optional[date]:
@@ -294,11 +317,24 @@ def load_rows(csv_path: Path) -> List[Dict[str, str]]:
 
         for idx, raw in enumerate(reader, start=3):
             row = _clean_row(raw)
-            contract_text = row.get("Future (System Direction)", "")
+            contract_text = row.get("Future (System Direction)", "") or row.get("FUTURE", "")
             if not contract_text:
                 continue
 
             parsed = parse_contract(contract_text, reference_year)
+            # Ignore footer/open-position/non-signal rows.
+            if parsed is None:
+                continue
+            if parse_float(row.get("ENTRY", "")) is None:
+                continue
+            if parse_float(row.get("STOP", "")) is None:
+                continue
+            if parse_float(row.get("Target1", "")) is None:
+                continue
+            if parse_float(row.get("Target2", "")) is None:
+                continue
+            if parse_float(row.get("Target3", "")) is None:
+                continue
             is_live, send_mult = parse_status(row.get("STATUS", ""))
             signal_date = file_date.isoformat() if file_date else ""
 
@@ -308,6 +344,7 @@ def load_rows(csv_path: Path) -> List[Dict[str, str]]:
                     "source_line": str(idx),
                     "signal_date": signal_date,
                     "contract_text": contract_text,
+                    "program": parse_program(contract_text),
                     "futures_clean": format_futures_clean(parsed),
                     "contract_code": format_contract_code(parsed),
                     "contract_name": format_contract_name(parsed),
@@ -373,7 +410,7 @@ def resolve_quote(row: Dict[str, str], mode: str, quote_cache: Dict[str, QuoteRe
         parsed = ParsedContract(root=root, month_code=month_code, year=int(year_text))
         candidates.extend(contract_candidates(parsed))
     if mode in {"continuous", "both"} and root in US_CONTINUOUS_SYMBOLS:
-        candidates.append(US_CONTINUOUS_SYMBOLS[root])
+        candidates.extend(CONTINUOUS_SYMBOL_CANDIDATES.get(root, [US_CONTINUOUS_SYMBOLS[root]]))
 
     if not candidates:
         return QuoteResult(symbol="", price=None, timestamp=None, source="none", error="No Yahoo candidate symbols")
@@ -415,7 +452,7 @@ def resolve_history_symbol(row: Dict[str, str], mode: str) -> List[str]:
         parsed = ParsedContract(root=root, month_code=month_code, year=int(year_text))
         candidates.extend(contract_candidates(parsed))
     if mode in {"continuous", "both"} and root in US_CONTINUOUS_SYMBOLS:
-        candidates.append(US_CONTINUOUS_SYMBOLS[root])
+        candidates.extend(CONTINUOUS_SYMBOL_CANDIDATES.get(root, [US_CONTINUOUS_SYMBOLS[root]]))
 
     seen = set()
     return [c for c in candidates if not (c in seen or seen.add(c))]
@@ -446,7 +483,8 @@ def bar_hits_target(side: str, target: float, high: float, low: float) -> bool:
 
 
 def simulate_trade(row: Dict[str, str], bars, intrabar_policy: str) -> TradeState:
-    side = row.get("side", "")
+    side_raw = str(row.get("side", "")).upper()
+    side = {"BUY": "L", "SELL": "S"}.get(side_raw, side_raw)
     root = row.get("root", "")
     entry = parse_price(row.get("entry", ""), root)
     stop = parse_price(row.get("stop", ""), root)
