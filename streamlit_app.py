@@ -444,41 +444,68 @@ def _state_bucket(row: Dict[str, str]) -> Tuple[str, str, str]:
         return ("DORMANT", "Dormant", "#E5E7EB")
 
     if condition in {"history_unavailable", "history_skipped"}:
-        return ("NO_DATA", "Live (no market data)", "#F3F4F6")
+        return ("NO_DATA", "Live (no market data)", "#E5E7EB")
 
     if condition == "waiting_entry":
         return ("WAITING_ENTRY", "Live, waiting entry", "#FFF59D")
 
     if condition == "open_after_trigger":
         if targets_hit <= 0:
-            return ("TRIGGERED", "Entry triggered, working T1 + stop", "#C8E6C9")
+            return ("TRIGGERED", "Entry Triggered, working T1 + stop", "#F59E0B")
         if targets_hit == 1:
-            return ("T1_OPEN", "Target1 hit, working T2 + stop@entry", "#81C784")
+            return ("T1_OPEN", "Target1 Filled, working T2 + stop@entry", "#93C5FD")
         if targets_hit == 2:
-            return ("T2_OPEN", "Target2 hit, working T3 + stop@entry", "#388E3C")
-        return ("T3_DONE", "All targets filled", "#1B5E20")
+            return ("T2_OPEN", "Target2 Filled, working T3 + stop@entry", "#60A5FA")
+        return ("T3_DONE", "All targets Filled", "#15803D")
 
     if condition == "all_targets_filled":
-        return ("T3_DONE", "All targets filled", "#1B5E20")
+        return ("T3_DONE", "All targets Filled", "#15803D")
 
     if condition == "max_hold_closed":
-        if targets_hit <= 0:
-            return ("HOLD_CLOSED", "Max hold close (flat at 4PM)", "#38BDF8")
-        return ("HOLD_CLOSED", "Max hold close after targets", "#0EA5E9")
+        outcome = str(row.get("max_hold_outcome", "flat")).lower()
+        if outcome == "positive":
+            return ("HOLD_CLOSED", "Max hold close (profit/flat/loss)", "#22C55E")
+        if outcome == "negative":
+            return ("HOLD_CLOSED", "Max hold close (profit/flat/loss)", "#EF4444")
+        return ("HOLD_CLOSED", "Max hold close (profit/flat/loss)", "#9CA3AF")
 
     if condition == "stopped_out":
         if targets_hit <= 0:
-            return ("STOPPED", "Triggered, stopped out", "#EF4444")
+            return ("STOPPED", "Hard Stop", "#EF4444")
         if targets_hit == 1:
-            return ("T1_STOP", "Target1 hit, then stopped at entry", "#F59E0B")
+            return ("T1_STOP", "Target 1 Filled, Stop @ Entry", "#22C55E")
         if targets_hit == 2:
-            return ("T2_STOP", "Target2 hit, then stopped at entry", "#D97706")
+            return ("T2_STOP", "Target 2 Filled, Stop @ Target 1", "#16A34A")
         return ("STOPPED", "Stopped out", "#EF4444")
 
     if condition == "invalid_levels":
         return ("INVALID", "Invalid levels", "#FCA5A5")
 
     return ("UNKNOWN", condition or "Unknown", "#E5E7EB")
+
+
+def _ensure_state_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    work = df.copy()
+    needed = {"state_key", "state_label", "state_color"}
+    if needed.issubset(set(work.columns)):
+        missing_mask = (
+            work["state_key"].astype(str).str.strip().eq("")
+            | work["state_label"].astype(str).str.strip().eq("")
+            | work["state_color"].astype(str).str.strip().eq("")
+        )
+        if not missing_mask.any():
+            return work
+    rows = []
+    for _, r in work.iterrows():
+        row = {k: r.get(k, "") for k in work.columns}
+        state_key, state_label, state_color = _state_bucket(row)
+        row["state_key"] = state_key
+        row["state_label"] = state_label
+        row["state_color"] = state_color
+        rows.append(row)
+    return pd.DataFrame(rows)
 
 
 def _analyze(
@@ -499,6 +526,7 @@ def _analyze(
 
     for row in rows:
         out = dict(row)
+        out["max_hold_outcome"] = ""
 
         if include_quotes:
             quote = ftm.resolve_quote(row, mode, quote_cache)
@@ -540,6 +568,23 @@ def _analyze(
             forced_exit_px = _close_price_at_or_before_cutoff(bars, cutoff_et, market_price)
             if forced_exit_px is not None:
                 market_price = float(forced_exit_px)
+            try:
+                entry_px = ftm.parse_price(str(row.get("entry", "")), str(row.get("root", "")))
+            except Exception:
+                entry_px = None
+            side_raw = str(row.get("side", "")).upper()
+            is_buy_side = side_raw in {"BUY", "L"}
+            if forced_exit_px is not None and entry_px is not None and side_raw in {"BUY", "SELL", "L", "S"}:
+                pnl_points = float(forced_exit_px) - float(entry_px)
+                signed = pnl_points if is_buy_side else -pnl_points
+                if signed > 1e-12:
+                    out["max_hold_outcome"] = "positive"
+                elif signed < -1e-12:
+                    out["max_hold_outcome"] = "negative"
+                else:
+                    out["max_hold_outcome"] = "flat"
+            else:
+                out["max_hold_outcome"] = "flat"
             prior_notes = state.notes or ""
             forced_note = f"Max hold close executed at 4:00 PM ET on {cutoff_et.strftime('%Y-%m-%d')}."
             if forced_exit_px is not None:
@@ -1331,6 +1376,7 @@ def _render_portfolio_table(portfolio_df: pd.DataFrame) -> None:
         "WAITING_ENTRY",
         "TRIGGERED",
         "T1_OPEN",
+        "T2_OPEN",
         "HOLD_CLOSED",
         "NO_DATA",
         "DORMANT",
@@ -1524,6 +1570,7 @@ def _style_table(df: pd.DataFrame):
         "WAITING_ENTRY",
         "TRIGGERED",
         "T1_OPEN",
+        "T2_OPEN",
         "HOLD_CLOSED",
         "NO_DATA",
         "DORMANT",
@@ -2023,6 +2070,8 @@ def main() -> None:
         st.session_state.last_df = df.copy()
 
     display_df = st.session_state.last_df
+    display_df = _ensure_state_columns(display_df)
+    st.session_state.last_df = display_df
     if "trade_id" not in display_df.columns:
         display_df = display_df.copy()
         display_df["trade_id"] = (
@@ -2055,13 +2104,14 @@ def main() -> None:
         legend = pd.DataFrame(
             [
                 {"State": "Live, waiting entry", "Color": "Yellow"},
-                {"State": "Entry triggered, working T1 + stop", "Color": "Light Green"},
-                {"State": "Target1 hit, working T2 + stop@entry", "Color": "Medium Green"},
-                {"State": "Target2 hit, working T3 + stop@entry", "Color": "Dark Green"},
-                {"State": "All targets filled", "Color": "Darkest Green"},
-                {"State": "Triggered, stopped out", "Color": "Red"},
-                {"State": "Target1/2 hit, then stopped at entry", "Color": "Orange"},
-                {"State": "Max hold close at 4PM ET", "Color": "Blue"},
+                {"State": "Entry Triggered, working T1 + stop", "Color": "Orange"},
+                {"State": "Target1 Filled, working T2 + stop@entry", "Color": "Light Blue"},
+                {"State": "Target2 Filled, working T3 + stop@entry", "Color": "Blue"},
+                {"State": "Target 1 Filled, Stop @ Entry", "Color": "Green"},
+                {"State": "Target 2 Filled, Stop @ Target 1", "Color": "Dark Green"},
+                {"State": "All targets Filled", "Color": "Darkest Green"},
+                {"State": "Hard Stop", "Color": "Red"},
+                {"State": "Max hold close (profit/flat/loss)", "Color": "Green/Gray/Red"},
                 {"State": "Live (no market data)", "Color": "Light Gray"},
             ]
         )
