@@ -139,6 +139,9 @@ RAW_ROW_COLUMNS = [
     "position",
     "account",
     "max_hold_date",
+    "cache_carry",
+    "cache_targets_hit",
+    "cache_remaining_size",
 ]
 
 
@@ -257,7 +260,16 @@ def _load_open_positions_cache() -> List[Dict[str, str]]:
         with OPEN_CACHE_PATH.open("r", newline="", encoding="utf-8") as fh:
             reader = csv.DictReader(fh)
             for raw in reader:
-                rows.append({k: (v or "") for k, v in raw.items()})
+                clean = {k: (v or "") for k, v in raw.items()}
+                # Backward-compatible defaults for legacy cache files.
+                if not clean.get("cache_carry", "").strip():
+                    clean["cache_carry"] = "1"
+                if not clean.get("cache_targets_hit", "").strip():
+                    clean["cache_targets_hit"] = "0"
+                if not clean.get("cache_remaining_size", "").strip():
+                    pos = abs(float(pd.to_numeric(clean.get("position", 0), errors="coerce") or 0.0))
+                    clean["cache_remaining_size"] = "1.0" if pos > 0 else "0.0"
+                rows.append(clean)
     except Exception:
         return []
     return rows
@@ -268,25 +280,48 @@ def _merge_with_open_cache(input_rows: List[Dict[str, str]], cached_rows: List[D
     for row in cached_rows:
         merged[_position_key(row)] = row
     for row in input_rows:
-        merged[_position_key(row)] = row
+        key = _position_key(row)
+        existing = merged.get(key, {})
+        combined = dict(row)
+        existing_carry = str(existing.get("cache_carry", "")).strip() == "1"
+        input_is_live = str(row.get("is_live", "")).strip() == "True"
+        input_pos_abs = abs(float(pd.to_numeric(row.get("position", 0), errors="coerce") or 0.0))
+
+        # If we already have a carried open position and today's row is inactive/blank,
+        # keep the cached open row as the authoritative state.
+        if existing_carry and (not input_is_live or input_pos_abs <= 0):
+            merged[key] = existing
+            continue
+
+        for k in ["cache_carry", "cache_targets_hit", "cache_remaining_size"]:
+            if existing.get(k, "") and not combined.get(k, ""):
+                combined[k] = existing.get(k, "")
+        merged[key] = combined
     return list(merged.values())
 
 
 def _save_open_positions_cache(display_df: pd.DataFrame) -> None:
     if display_df.empty:
-        OPEN_CACHE_PATH.write_text("", encoding="utf-8")
+        # Preserve existing cache if this run has no snapshot rows.
         return
     keep = display_df[
         (display_df.get("condition", "") == "open_after_trigger")
         & (pd.to_numeric(display_df.get("current_position", 0), errors="coerce").abs() > 0)
     ].copy()
     if keep.empty:
-        OPEN_CACHE_PATH.write_text("", encoding="utf-8")
+        # Preserve existing cache to avoid accidental wipe on temporary/no-data runs.
         return
 
     out_rows: List[Dict[str, str]] = []
     for _, r in keep.iterrows():
-        out_rows.append({col: str(r.get(col, "")) for col in RAW_ROW_COLUMNS})
+        row_out = {col: str(r.get(col, "")) for col in RAW_ROW_COLUMNS}
+        qty_abs = abs(float(pd.to_numeric(r.get("qty", r.get("position", 0)), errors="coerce") or 0.0))
+        cur_abs = abs(float(pd.to_numeric(r.get("current_position", 0), errors="coerce") or 0.0))
+        remaining = 0.0 if qty_abs <= 0 else max(0.0, min(1.0, cur_abs / qty_abs))
+        row_out["cache_carry"] = "1"
+        row_out["cache_targets_hit"] = str(int(float(pd.to_numeric(r.get("targets_hit", 0), errors="coerce") or 0)))
+        row_out["cache_remaining_size"] = str(remaining)
+        out_rows.append(row_out)
 
     dedup: Dict[str, Dict[str, str]] = {}
     for row in out_rows:
@@ -562,6 +597,52 @@ def _analyze(
                 market_price = float(bars["Close"].iloc[-1])
             except Exception:
                 market_price = None
+
+        # Carry previously open positions across daily uploads.
+        # If a cached open position does not retrigger within the current session window,
+        # keep it open with the cached progression state.
+        cache_carry = str(row.get("cache_carry", "")).strip() == "1"
+        if cache_carry and state.condition in {"waiting_entry", "history_unavailable", "history_skipped"}:
+            root = str(row.get("root", ""))
+            entry_px = _parse_price_with_root(row.get("entry", ""), root)
+            stop_px = _parse_price_with_root(row.get("stop", ""), root)
+            t1_px = _parse_price_with_root(row.get("target1", ""), root)
+            t2_px = _parse_price_with_root(row.get("target2", ""), root)
+            t3_px = _parse_price_with_root(row.get("target3", ""), root)
+            try:
+                cached_targets = int(float(str(row.get("cache_targets_hit", "0") or "0")))
+            except Exception:
+                cached_targets = 0
+            cached_targets = max(0, min(3, cached_targets))
+            try:
+                cached_remaining = float(str(row.get("cache_remaining_size", "0") or "0"))
+            except Exception:
+                cached_remaining = 0.0
+            cached_remaining = max(0.0, min(1.0, cached_remaining))
+            next_target_name = ""
+            next_target_price = None
+            if cached_targets == 0:
+                next_target_name, next_target_price = "target1", t1_px
+            elif cached_targets == 1:
+                next_target_name, next_target_price = "target2", t2_px
+            elif cached_targets == 2:
+                next_target_name, next_target_price = "target3", t3_px
+            working_stop = None
+            if cached_remaining > 0:
+                if cached_targets >= 1 and entry_px is not None:
+                    working_stop = float(entry_px)
+                elif stop_px is not None:
+                    working_stop = float(stop_px)
+            state = ftm.TradeState(
+                condition="open_after_trigger",
+                notes="carried open position from prior session cache",
+                working_stop_price=working_stop,
+                working_stop_size=cached_remaining,
+                next_target=next_target_name if cached_remaining > 0 and next_target_price is not None else None,
+                next_target_price=None if next_target_price is None else float(next_target_price),
+                remaining_size=cached_remaining,
+                targets_hit=cached_targets,
+            )
 
         cutoff_et = _parse_max_hold_cutoff_et(row.get("max_hold_date", ""))
         if cutoff_et is not None and now_et >= cutoff_et and state.condition == "open_after_trigger":
@@ -993,7 +1074,8 @@ def _build_trade_action_rows(price_df: pd.DataFrame, row: Dict[str, str], x_col:
         if target_px is None:
             continue
         hit_idx = None
-        for j in range(last_event_idx + 1, len(price_df)):
+        # Allow same-bar fills after trigger/previous target.
+        for j in range(last_event_idx, len(price_df)):
             hi = float(price_df.iloc[j]["High"])
             lo = float(price_df.iloc[j]["Low"])
             if is_buy and hi >= float(target_px):
@@ -1025,7 +1107,8 @@ def _build_trade_action_rows(price_df: pd.DataFrame, row: Dict[str, str], x_col:
 
         if stop_price is not None:
             stop_idx = None
-            for j in range(last_event_idx + 1, len(price_df)):
+            # Stop may occur on the same bar as the latest target event.
+            for j in range(last_event_idx, len(price_df)):
                 hi = float(price_df.iloc[j]["High"])
                 lo = float(price_df.iloc[j]["Low"])
                 if is_buy and lo <= float(stop_price):
@@ -1204,8 +1287,8 @@ def _render_stat_cards(portfolio_df: pd.DataFrame, exposure_stats: Dict[str, flo
     )
 
     r1 = st.columns(6)
-    r1[0].markdown(_metric_card("Daily P/L USD", _abbr_number(daily_pl), _value_color(daily_pl)), unsafe_allow_html=True)
-    r1[1].markdown(_metric_card("Daily P/L %", f"{daily_pl_pct:,.2f}%", _value_color(daily_pl_pct)), unsafe_allow_html=True)
+    r1[0].markdown(_metric_card("Total P/L USD", _abbr_number(daily_pl), _value_color(daily_pl)), unsafe_allow_html=True)
+    r1[1].markdown(_metric_card("Total P/L %", f"{daily_pl_pct:,.2f}%", _value_color(daily_pl_pct)), unsafe_allow_html=True)
     r1[2].markdown(_metric_card("Unrealized P/L USD", _abbr_number(unrealized_pl), _value_color(unrealized_pl)), unsafe_allow_html=True)
     r1[3].markdown(_metric_card("Unrealized P/L %", f"{unrealized_pl_pct:,.2f}%", _value_color(unrealized_pl_pct)), unsafe_allow_html=True)
     r1[4].markdown(_metric_card("Realized P/L USD", _abbr_number(realized_pl), _value_color(realized_pl)), unsafe_allow_html=True)
@@ -1262,7 +1345,7 @@ def _render_program_stats(portfolio_df: pd.DataFrame) -> None:
 
         st.markdown(f"**{program}**")
         c1, c2, c3, c4, c5 = st.columns(5)
-        c1.markdown(_metric_card("Daily P/L", f"${daily_pl:,.2f}", _value_color(daily_pl), f"{trades} trade(s)"), unsafe_allow_html=True)
+        c1.markdown(_metric_card("Total P/L", f"${daily_pl:,.2f}", _value_color(daily_pl), f"{trades} trade(s)"), unsafe_allow_html=True)
         c2.markdown(_metric_card("Unrealized P/L", f"${unrealized_pl:,.2f}", _value_color(unrealized_pl)), unsafe_allow_html=True)
         c3.markdown(_metric_card("Realized P/L", f"${realized_pl:,.2f}", _value_color(realized_pl)), unsafe_allow_html=True)
         c4.markdown(_metric_card("VaR to Stop", f"${var_to_stop:,.2f}", "#F59E0B"), unsafe_allow_html=True)
@@ -1325,6 +1408,14 @@ def _render_portfolio_table(portfolio_df: pd.DataFrame) -> None:
         work["market_px"] = pd.to_numeric(work.get("market_price", work.get("quote_price", 0)), errors="coerce").fillna(0.0)
     if "session_open_px" not in work.columns:
         work["session_open_px"] = pd.to_numeric(work.get("session_open_price", 0), errors="coerce").fillna(0.0)
+    if "cache_carry" not in work.columns:
+        work["cache_carry"] = ""
+
+    work = work.copy()
+    work["_carry_rank"] = work["cache_carry"].astype(str).eq("1")
+    work["_pos_rank"] = pd.to_numeric(work.get("current_position", 0), errors="coerce").abs().fillna(0.0)
+    work = work.sort_values(by=["_carry_rank", "_pos_rank", "contract_code"], ascending=[False, False, True], kind="stable")
+    work = work.drop(columns=["_carry_rank", "_pos_rank"])
 
     table_cols = [
         "program",
@@ -1366,8 +1457,8 @@ def _render_portfolio_table(portfolio_df: pd.DataFrame) -> None:
         "unrealized_pl": "unrealized_pl",
         "unrealized_pl_pct": "unrealized_pl_%",
         "realized_pl_pct": "realized_pl_%",
-        "daily_pl": "daily_pl",
-        "daily_pl_pct": "daily_pl_%",
+        "daily_pl": "total_pl",
+        "daily_pl_pct": "total_pl_%",
     }
     show = show.rename(columns=rename)
     state_color_map = work.get("state_color", pd.Series(["#E5E7EB"] * len(work), index=work.index)).to_dict()
@@ -1394,7 +1485,7 @@ def _render_portfolio_table(portfolio_df: pd.DataFrame) -> None:
             styles[i] = f"background-color: {bg}; color: {fg}; font-weight: 700;"
 
         # P/L color coding: green positive, red negative, gray zero.
-        for col in ["daily_pl", "daily_pl_%", "unrealized_pl", "unrealized_pl_%", "realized_pl", "realized_pl_%"]:
+        for col in ["total_pl", "total_pl_%", "unrealized_pl", "unrealized_pl_%", "realized_pl", "realized_pl_%"]:
             if col not in row.index:
                 continue
             i = row.index.get_loc(col)
@@ -1418,7 +1509,7 @@ def _render_portfolio_table(portfolio_df: pd.DataFrame) -> None:
         return f"{float(num):,.2f}%"
 
     formatters = {
-        "daily_pl": _fmt_usd,
+        "total_pl": _fmt_usd,
         "unrealized_pl": _fmt_usd,
         "realized_pl": _fmt_usd,
         "max_risk": _fmt_usd,
@@ -1427,7 +1518,7 @@ def _render_portfolio_table(portfolio_df: pd.DataFrame) -> None:
         "entry": _fmt_usd,
         "current_price": _fmt_usd,
         "session_open": _fmt_usd,
-        "daily_pl_%": _fmt_pct,
+        "total_pl_%": _fmt_pct,
         "unrealized_pl_%": _fmt_pct,
         "realized_pl_%": _fmt_pct,
         "current_position": "{:,.2f}",
@@ -1501,8 +1592,9 @@ def _render_var_to_stop_tab(portfolio_df: pd.DataFrame) -> None:
             st.caption("No open positions.")
             continue
         subset = subset.sort_values("stop_var", ascending=False)
+        subset_show = subset[show_cols].rename(columns={"daily_pl": "total_pl"})
         st.dataframe(
-            subset[show_cols],
+            subset_show,
             use_container_width=True,
             hide_index=True,
             height=_table_height(len(subset), min_rows=8, max_rows=30),
@@ -1577,12 +1669,37 @@ def _style_table(df: pd.DataFrame):
         "UNKNOWN",
     }
 
+    def _working_cols_for_row(row: pd.Series) -> List[str]:
+        condition = str(row.get("condition", ""))
+        try:
+            targets_hit = int(float(row.get("targets_hit", 0)))
+        except Exception:
+            targets_hit = 0
+        if condition != "open_after_trigger":
+            return []
+        if targets_hit <= 0:
+            return ["stop", "target1"]
+        if targets_hit == 1:
+            return ["entry", "target2"]
+        if targets_hit == 2:
+            return ["target1", "target3"]
+        return []
+
     def color_row(row):
         bg = colors[row.name]
         state_key = state_keys[row.name]
         fg = "#111827" if state_key in dark_text_states else "#FFFFFF"
-        style = f"background-color: {bg}; color: {fg}; font-weight: 600;"
-        return [style] * len(row)
+        base_style = f"background-color: {bg}; color: {fg}; font-weight: 600;"
+        styles = [base_style] * len(row)
+
+        # Highlight currently working bracket orders (cell-level overlay).
+        for col in _working_cols_for_row(row):
+            if col not in row.index:
+                continue
+            i = row.index.get_loc(col)
+            # Use explicit background fill; borders/shadows are unreliable in st.dataframe styles.
+            styles[i] = "background-color: #FDE047; color: #111827; font-weight: 800;"
+        return styles
 
     return df.style.apply(color_row, axis=1).set_properties(**{"font-size": "14px"})
 
@@ -1608,13 +1725,15 @@ def _sort_by_sheet_order(df: pd.DataFrame, file_order: List[str]) -> pd.DataFram
         return df
     work = df.copy()
     order_map = {name: idx for idx, name in enumerate(file_order)}
+    carry = work["cache_carry"] if "cache_carry" in work.columns else pd.Series([""] * len(work), index=work.index)
+    work["_carry_rank"] = carry.astype(str).eq("1")
     work["_file_rank"] = work.get("source_file", "").astype(str).map(order_map).fillna(len(order_map)).astype(int)
     work["_line_rank"] = pd.to_numeric(work.get("source_line", ""), errors="coerce").fillna(10**9).astype(int)
     work = work.sort_values(
-        by=["_file_rank", "_line_rank", "contract_code"],
-        ascending=[True, True, True],
+        by=["_carry_rank", "_file_rank", "_line_rank", "contract_code"],
+        ascending=[False, True, True, True],
         kind="stable",
-    ).drop(columns=["_file_rank", "_line_rank"])
+    ).drop(columns=["_carry_rank", "_file_rank", "_line_rank"])
     return work.reset_index(drop=True)
 
 
@@ -1650,14 +1769,35 @@ def _sort_for_selection(df: pd.DataFrame) -> pd.DataFrame:
     return work.reset_index(drop=True)
 
 
+def _signal_table_order(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    preferred = [
+        "program",
+        "contract_code",
+        "side",
+        "status",
+        "position",
+        "entry",
+        "stop",
+        "target1",
+        "target2",
+        "target3",
+        "state_label",
+    ]
+    cols = [c for c in preferred if c in df.columns] + [c for c in df.columns if c not in preferred]
+    return df[cols]
+
+
 def _render_section(df_section: pd.DataFrame, section_title: str) -> None:
     st.subheader(section_title)
+    df_show = _signal_table_order(df_section)
     counts = df_section["state_label"].value_counts().reset_index()
     counts.columns = ["State", "Count"]
     c1, c2 = st.columns([4, 1.3])
     with c1:
         st.dataframe(
-            _style_table(df_section),
+            _style_table(df_show),
             use_container_width=True,
             height=_table_height(len(df_section)),
         )
@@ -1790,21 +1930,6 @@ def _build_price_levels_chart(
             we = we.tz_localize(None)
         x_scale = alt.Scale(domain=[ws.to_pydatetime(), we.to_pydatetime()], nice=False)
     x_enc = alt.X(f"{x_col}:T", title="Time", scale=x_scale)
-    line = (
-        alt.Chart(price_df)
-        .mark_line(color="#60A5FA")
-        .encode(
-            x=x_enc,
-            y=alt.Y("Close:Q", title="Price"),
-            tooltip=[
-                alt.Tooltip(f"{x_col}:T"),
-                alt.Tooltip("Open:Q"),
-                alt.Tooltip("High:Q"),
-                alt.Tooltip("Low:Q"),
-                alt.Tooltip("Close:Q"),
-            ],
-        )
-    )
 
     level_specs = [
         ("entry", row.get("entry", ""), "#FDE047", "Entry"),
@@ -1825,132 +1950,78 @@ def _build_price_levels_chart(
     span = max(price_max - price_min, max(abs(price_max), 1.0) * 0.0025)
     pad = span * 0.12
     y_scale = alt.Scale(domain=[price_min - pad, price_max + pad], zero=False, nice=False)
+    wick = (
+        alt.Chart(price_df)
+        .mark_rule(color="#94A3B8")
+        .encode(
+            x=x_enc,
+            y=alt.Y("Low:Q", title="Price", scale=y_scale),
+            y2=alt.Y2("High:Q"),
+            tooltip=[
+                alt.Tooltip(f"{x_col}:T"),
+                alt.Tooltip("Open:Q"),
+                alt.Tooltip("High:Q"),
+                alt.Tooltip("Low:Q"),
+                alt.Tooltip("Close:Q"),
+            ],
+        )
+    )
+    body = (
+        alt.Chart(price_df)
+        .mark_bar(size=7)
+        .encode(
+            x=x_enc,
+            y=alt.Y("Open:Q", title="Price", scale=y_scale),
+            y2=alt.Y2("Close:Q"),
+            color=alt.condition("datum.Close >= datum.Open", alt.value("#22C55E"), alt.value("#EF4444")),
+            tooltip=[
+                alt.Tooltip(f"{x_col}:T"),
+                alt.Tooltip("Open:Q"),
+                alt.Tooltip("High:Q"),
+                alt.Tooltip("Low:Q"),
+                alt.Tooltip("Close:Q"),
+            ],
+        )
+    )
+    candles = wick + body
 
     marker_layer = None
-    side = str(row.get("side", "")).upper()
-    root = str(row.get("root", ""))
-    entry_value = _parse_price_with_root(row.get("entry", ""), root)
-    if entry_value is not None and side in {"BUY", "SELL", "L", "S"}:
-        is_buy = side in {"BUY", "L"}
-        trigger_idx = None
-        for i in range(len(price_df)):
-            hi = float(price_df.iloc[i]["High"])
-            lo = float(price_df.iloc[i]["Low"])
-            if (is_buy and hi >= float(entry_value)) or ((not is_buy) and lo <= float(entry_value)):
-                trigger_idx = i
-                break
+    action_rows = _build_trade_action_rows(price_df, row, x_col)
+    if action_rows:
+        marker_df = pd.DataFrame(
+            [{"ts": r["ts"], "px": r["px"], "dir": r["dir"], "event": r["event"]} for r in action_rows]
+        )
+        buy_df = marker_df[marker_df["dir"] == "BUY"]
+        sell_df = marker_df[marker_df["dir"] == "SELL"]
 
-        if trigger_idx is not None:
-            marker_rows = [
-                {
-                    "ts": price_df.iloc[trigger_idx][x_col],
-                    "px": float(entry_value),
-                    "dir": "BUY" if is_buy else "SELL",
-                    "event": "Trigger",
-                }
-            ]
-
-            # Add target action markers (long targets = SELL, short targets = BUY).
-            try:
-                targets_hit = int(float(str(row.get("targets_hit", "0") or "0")))
-            except ValueError:
-                targets_hit = 0
-            target_values = [
-                _parse_price_with_root(row.get("target1", ""), root),
-                _parse_price_with_root(row.get("target2", ""), root),
-                _parse_price_with_root(row.get("target3", ""), root),
-            ]
-            target_action = "SELL" if is_buy else "BUY"
-            last_event_idx = trigger_idx
-            for t_idx in range(min(targets_hit, 3)):
-                target_px = target_values[t_idx]
-                if target_px is None:
-                    continue
-                hit_idx = None
-                # Enforce event ordering: targets are searched after the prior event.
-                for j in range(last_event_idx + 1, len(price_df)):
-                    hi = float(price_df.iloc[j]["High"])
-                    lo = float(price_df.iloc[j]["Low"])
-                    if is_buy and hi >= float(target_px):
-                        hit_idx = j
-                        break
-                    if (not is_buy) and lo <= float(target_px):
-                        hit_idx = j
-                        break
-                if hit_idx is None:
-                    continue
-                marker_rows.append(
-                    {
-                        "ts": price_df.iloc[hit_idx][x_col],
-                        "px": float(target_px),
-                        "dir": target_action,
-                        "event": f"Target {t_idx + 1} Hit",
-                    }
+        layers = []
+        if not buy_df.empty:
+            layers.append(
+                alt.Chart(buy_df)
+                .mark_point(shape="triangle-up", size=260, filled=True, color="#22C55E", stroke="#FFFFFF", strokeWidth=1.8)
+                .encode(
+                    x=alt.X("ts:T", scale=x_scale),
+                    y=alt.Y("px:Q", scale=y_scale),
+                    tooltip=[alt.Tooltip("event:N"), alt.Tooltip("dir:N"), alt.Tooltip("px:Q"), alt.Tooltip("ts:T")],
                 )
-                last_event_idx = hit_idx
-
-            # Add stop-out action marker (e.g. short stopped out => BUY stop marker).
-            condition = str(row.get("condition", ""))
-            if condition == "stopped_out":
-                stop_price = _parse_price_with_root(row.get("stop", ""), root)
-                if targets_hit >= 1:
-                    stop_price = float(entry_value)
-
-                if stop_price is not None:
-                    stop_idx = None
-                    # Stop action must occur after the latest trigger/target event.
-                    for j in range(last_event_idx + 1, len(price_df)):
-                        hi = float(price_df.iloc[j]["High"])
-                        lo = float(price_df.iloc[j]["Low"])
-                        if is_buy and lo <= float(stop_price):
-                            stop_idx = j
-                            break
-                        if (not is_buy) and hi >= float(stop_price):
-                            stop_idx = j
-                            break
-
-                    if stop_idx is not None:
-                        marker_rows.append(
-                            {
-                                "ts": price_df.iloc[stop_idx][x_col],
-                                "px": float(stop_price),
-                                "dir": "SELL" if is_buy else "BUY",
-                                "event": "Stop Out",
-                            }
-                        )
-
-            marker_df = pd.DataFrame(marker_rows)
-            buy_df = marker_df[marker_df["dir"] == "BUY"]
-            sell_df = marker_df[marker_df["dir"] == "SELL"]
-
-            layers = []
-            if not buy_df.empty:
-                layers.append(
-                    alt.Chart(buy_df)
-                    .mark_point(shape="triangle-up", size=260, filled=True, color="#22C55E", stroke="#FFFFFF", strokeWidth=1.8)
-                    .encode(
-                        x=alt.X("ts:T", scale=x_scale),
-                        y=alt.Y("px:Q", scale=y_scale),
-                        tooltip=[alt.Tooltip("event:N"), alt.Tooltip("dir:N"), alt.Tooltip("px:Q"), alt.Tooltip("ts:T")],
-                    )
+            )
+        if not sell_df.empty:
+            layers.append(
+                alt.Chart(sell_df)
+                .mark_point(shape="triangle-down", size=260, filled=True, color="#DC2626", stroke="#FFFFFF", strokeWidth=1.8)
+                .encode(
+                    x=alt.X("ts:T", scale=x_scale),
+                    y=alt.Y("px:Q", scale=y_scale),
+                    tooltip=[alt.Tooltip("event:N"), alt.Tooltip("dir:N"), alt.Tooltip("px:Q"), alt.Tooltip("ts:T")],
                 )
-            if not sell_df.empty:
-                layers.append(
-                    alt.Chart(sell_df)
-                    .mark_point(shape="triangle-down", size=260, filled=True, color="#DC2626", stroke="#FFFFFF", strokeWidth=1.8)
-                    .encode(
-                        x=alt.X("ts:T", scale=x_scale),
-                        y=alt.Y("px:Q", scale=y_scale),
-                        tooltip=[alt.Tooltip("event:N"), alt.Tooltip("dir:N"), alt.Tooltip("px:Q"), alt.Tooltip("ts:T")],
-                    )
-                )
-            if layers:
-                marker_layer = layers[0]
-                for extra in layers[1:]:
-                    marker_layer = marker_layer + extra
+            )
+        if layers:
+            marker_layer = layers[0]
+            for extra in layers[1:]:
+                marker_layer = marker_layer + extra
 
     if not level_rows:
-        chart = line.encode(y=alt.Y("Close:Q", title="Price", scale=y_scale))
+        chart = candles
         if marker_layer is not None:
             chart = chart + marker_layer
         return chart.properties(height=430)
@@ -1970,7 +2041,7 @@ def _build_price_levels_chart(
         )
     )
 
-    chart = line.encode(y=alt.Y("Close:Q", title="Price", scale=y_scale)) + rules
+    chart = candles + rules
     if marker_layer is not None:
         chart = chart + marker_layer
     return chart.properties(height=430)
@@ -1995,6 +2066,7 @@ def main() -> None:
         refresh_minutes = st.slider("Refresh minutes", min_value=1, max_value=60, value=5, step=1)
         manual_refresh = st.button("Refresh now")
         clear_files = st.button("Clear uploaded files")
+        open_cache_file = st.file_uploader("Load Open Position Cache CSV", type=["csv"], accept_multiple_files=False)
         st.caption("Delete individual uploaded file")
         delete_target = st.selectbox(
             "Select file to delete",
@@ -2019,6 +2091,11 @@ def main() -> None:
             p.unlink(missing_ok=True)
         OPEN_CACHE_PATH.unlink(missing_ok=True)
         st.success("Cleared saved uploaded files.")
+        st.rerun()
+
+    if open_cache_file is not None:
+        OPEN_CACHE_PATH.write_bytes(open_cache_file.getvalue())
+        st.success("Loaded open position cache file.")
         st.rerun()
 
     if delete_selected_file and delete_target:
