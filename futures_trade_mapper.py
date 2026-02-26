@@ -556,6 +556,9 @@ def simulate_trade(row: Dict[str, str], bars, intrabar_policy: str) -> TradeStat
                 if target_name == "target1":
                     stop_price = float(entry)
                     notes.append("stop moved to entry after target1")
+                elif target_name == "target2":
+                    stop_price = float(t1)
+                    notes.append("stop moved to target1 after target2")
                 if remaining <= 0:
                     return TradeState(
                         condition="all_targets_filled",

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import importlib.util
 import json
@@ -45,6 +46,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = SCRIPT_DIR / ".uploaded_trades"
 UPLOAD_DIR.mkdir(exist_ok=True)
 OPEN_CACHE_PATH = UPLOAD_DIR / ".open_positions_cache.csv"
+CLOSED_CACHE_PATH = UPLOAD_DIR / ".closed_positions_cache.csv"
 SIZE_FRACTIONS = [0.50, 0.25, 0.25]
 CONTRACT_MULTIPLIERS = {
     "ES": 50.0,
@@ -347,6 +349,70 @@ def _write_open_positions_cache_rows(rows: List[Dict[str, str]]) -> None:
         writer.writerows(list(dedup.values()))
 
 
+def _load_closed_positions_cache() -> pd.DataFrame:
+    if not CLOSED_CACHE_PATH.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(CLOSED_CACHE_PATH, dtype=str).fillna("")
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _merge_with_closed_cache(current_df: pd.DataFrame, closed_df: pd.DataFrame) -> pd.DataFrame:
+    if current_df.empty and closed_df.empty:
+        return pd.DataFrame()
+    if closed_df.empty:
+        return current_df
+    if current_df.empty:
+        return closed_df
+    left = current_df.copy()
+    right = closed_df.copy()
+    all_cols = list(dict.fromkeys(list(left.columns) + list(right.columns)))
+    left = left.reindex(columns=all_cols, fill_value="")
+    right = right.reindex(columns=all_cols, fill_value="")
+    merged = pd.concat([left, right], ignore_index=True)
+    if "trade_id" in merged.columns:
+        # Closed cache should win for duplicate trade_id values inside the same upload cycle.
+        # Without this, a fresh "waiting_entry" row from today's sheet can overwrite
+        # a carry trade that closed earlier and was persisted in closed cache.
+        closed_conditions = {"stopped_out", "all_targets_filled", "max_hold_closed"}
+        cond = merged.get("condition", pd.Series([""] * len(merged), index=merged.index)).astype(str)
+        merged["_closed_rank"] = cond.isin(closed_conditions)
+        merged = (
+            merged.sort_values(by="_closed_rank", ascending=False, kind="stable")
+            .drop_duplicates(subset=["trade_id"], keep="first")
+            .drop(columns=["_closed_rank"])
+        )
+    return merged.reset_index(drop=True)
+
+
+def _save_closed_positions_cache(display_df: pd.DataFrame) -> None:
+    if display_df.empty:
+        return
+    closed_conditions = {"stopped_out", "all_targets_filled", "max_hold_closed"}
+    closed = display_df[display_df.get("condition", "").isin(closed_conditions)].copy()
+    if closed.empty:
+        return
+
+    existing = _load_closed_positions_cache()
+    closed = closed.astype(str)
+    if existing.empty:
+        out = closed
+    else:
+        all_cols = list(dict.fromkeys(list(existing.columns) + list(closed.columns)))
+        out = pd.concat(
+            [
+                existing.reindex(columns=all_cols, fill_value=""),
+                closed.reindex(columns=all_cols, fill_value=""),
+            ],
+            ignore_index=True,
+        )
+    if "trade_id" in out.columns:
+        out = out.drop_duplicates(subset=["trade_id"], keep="last")
+    out.to_csv(CLOSED_CACHE_PATH, index=False)
+
+
 def _parse_max_hold_cutoff_et(max_hold_date_text: object) -> Optional[datetime]:
     text = str(max_hold_date_text or "").strip()
     if not text:
@@ -456,6 +522,15 @@ def _save_uploaded_files(uploaded_files) -> List[Path]:
     return saved_paths
 
 
+def _uploaded_files_signature(uploaded_files) -> str:
+    parts: List[str] = []
+    for uf in sorted(uploaded_files, key=lambda x: x.name):
+        data = uf.getvalue()
+        digest = hashlib.sha1(data).hexdigest()
+        parts.append(f"{uf.name}:{len(data)}:{digest}")
+    return "|".join(parts)
+
+
 def _load_rows_from_saved_files(paths: List[Path]) -> List[Dict[str, str]]:
     all_rows: List[Dict[str, str]] = []
     for path in paths:
@@ -490,7 +565,7 @@ def _state_bucket(row: Dict[str, str]) -> Tuple[str, str, str]:
         if targets_hit == 1:
             return ("T1_OPEN", "Target1 Filled, working T2 + stop@entry", "#93C5FD")
         if targets_hit == 2:
-            return ("T2_OPEN", "Target2 Filled, working T3 + stop@entry", "#60A5FA")
+            return ("T2_OPEN", "Target2 Filled, working T3 + stop@target1", "#60A5FA")
         return ("T3_DONE", "All targets Filled", "#15803D")
 
     if condition == "all_targets_filled":
@@ -837,6 +912,10 @@ def _render_outcome_scenarios(display_df: pd.DataFrame) -> None:
             * scen.loc[is_sell, "multiplier"]
         )
 
+    # Closed-cache merges can introduce numeric fields as strings.
+    for col in ["max_entry_notional", "max_risk", "max_reward"]:
+        scen[col] = pd.to_numeric(scen.get(col, 0), errors="coerce").fillna(0.0)
+
     scen = scen[scen.get("is_live", "False") == "True"].copy()
     if scen.empty:
         st.info("No live trades for scenario analysis.")
@@ -989,7 +1068,10 @@ def _build_portfolio_snapshot(display_df: pd.DataFrame) -> pd.DataFrame:
                     exit_px = _parse_price_with_root(r.get("stop", ""), root)
                     if exit_px is None:
                         exit_px = entry
-                    if targets_hit >= 1:
+                    if targets_hit >= 2:
+                        t1_px = _parse_price_with_root(r.get("target1", ""), root)
+                        exit_px = entry if t1_px is None else float(t1_px)
+                    elif targets_hit >= 1:
                         exit_px = entry
                 realized += qty * remaining * direction * (float(exit_px) - entry) * mult
         return realized
@@ -1003,10 +1085,12 @@ def _build_portfolio_snapshot(display_df: pd.DataFrame) -> pd.DataFrame:
     df["realized_pl_pct"] = (df["realized_pl"] / base) * 100.0
     df["notional"] = (df["current_position"].abs() * df["market_px"] * df["multiplier"]).fillna(0.0)
 
-    # Stop-based VaR for open positions only (with stop moved to entry after T1+).
+    # Stop-based VaR for open positions only:
+    # after T1 -> stop@entry; after T2 -> stop@target1.
     df["targets_hit_num"] = pd.to_numeric(df.get("targets_hit", 0), errors="coerce").fillna(0.0)
     df["effective_stop_px"] = df["stop_num"]
     df.loc[df["targets_hit_num"] >= 1, "effective_stop_px"] = df["entry_px"]
+    df.loc[df["targets_hit_num"] >= 2, "effective_stop_px"] = df["target1_num"]
     open_mask = (df.get("condition", "") == "open_after_trigger") & (df["current_position"].abs() > 0)
     long_mask = open_mask & (df.get("side", "") == "BUY")
     short_mask = open_mask & (df.get("side", "") == "SELL")
@@ -1102,7 +1186,10 @@ def _build_trade_action_rows(price_df: pd.DataFrame, row: Dict[str, str], x_col:
     condition = str(row.get("condition", ""))
     if condition == "stopped_out":
         stop_price = _parse_price_with_root(row.get("stop", ""), root)
-        if targets_hit >= 1:
+        if targets_hit >= 2:
+            t1_px = _parse_price_with_root(row.get("target1", ""), root)
+            stop_price = float(entry_value) if t1_px is None else float(t1_px)
+        elif targets_hit >= 1:
             stop_price = float(entry_value)
 
         if stop_price is not None:
@@ -1265,8 +1352,6 @@ def _render_stat_cards(portfolio_df: pd.DataFrame, exposure_stats: Dict[str, flo
     unrealized_pl = float(portfolio_df["unrealized_pl"].sum())
     daily_pl = float(portfolio_df["daily_pl"].sum())
     gross_exposure_now = float(portfolio_df["notional"].sum())
-    max_exposure = float(exposure_stats.get("max", 0.0))
-    max_net_exposure = float(exposure_stats.get("max_net", 0.0))
     stop_var_open = float(portfolio_df["stop_var"].sum()) if "stop_var" in portfolio_df.columns else 0.0
 
     base = float((portfolio_df["qty"].abs() * portfolio_df["entry_px"] * portfolio_df["multiplier"]).sum())
@@ -1299,12 +1384,7 @@ def _render_stat_cards(portfolio_df: pd.DataFrame, exposure_stats: Dict[str, flo
     r2[1].markdown(_metric_card("Long Value", _abbr_number(long_value), "#22C55E"), unsafe_allow_html=True)
     r2[2].markdown(_metric_card("Short Value", _abbr_number(short_value), "#EF4444"), unsafe_allow_html=True)
     r2[3].markdown(
-        _metric_card(
-            "Gross Exposure",
-            f"{_abbr_number(gross_exposure_now)} / {_abbr_number(max_exposure)}",
-            "#60A5FA",
-            "Current / Max (session)",
-        ),
+        _metric_card("Gross Exposure", _abbr_number(gross_exposure_now), "#60A5FA"),
         unsafe_allow_html=True,
     )
     r2[4].markdown(_metric_card("VaR to Stop", _abbr_number(stop_var_open), "#F59E0B"), unsafe_allow_html=True)
@@ -1529,7 +1609,7 @@ def _render_portfolio_table(portfolio_df: pd.DataFrame) -> None:
     st.dataframe(
         show.style.apply(_portfolio_row_style, axis=1).format(applicable_formatters).set_properties(**{"font-size": "14px"}),
         use_container_width=True,
-        height=260,
+        height=_table_height(len(show), min_rows=8, max_rows=45),
         hide_index=True,
     )
 
@@ -1566,6 +1646,34 @@ def _render_var_to_stop_tab(portfolio_df: pd.DataFrame) -> None:
     c5.markdown(
         _metric_card("Top Position VaR", _abbr_number(top_var), "#F59E0B", f"{top_var_pct:,.1f}% of total VaR"),
         unsafe_allow_html=True,
+    )
+
+    # VaR by asset class.
+    if "asset_class" not in open_df.columns:
+        open_df["asset_class"] = open_df.get("root", "").map(ASSET_CLASS_BY_ROOT).fillna("Other")
+    class_tbl = (
+        open_df.groupby("asset_class", as_index=False)
+        .agg(
+            var_to_stop=("stop_var", "sum"),
+            gross_exposure=("notional", "sum"),
+            trades=("trade_id", "count"),
+        )
+        .sort_values("var_to_stop", ascending=False)
+    )
+    class_tbl["var_pct_total"] = class_tbl["var_to_stop"] / max(total_var, 1e-12) * 100.0
+    st.markdown("**VaR by Asset Class**")
+    st.dataframe(
+        class_tbl.style.format(
+            {
+                "var_to_stop": lambda v: f"${float(v):,.2f}",
+                "gross_exposure": lambda v: f"${float(v):,.2f}",
+                "var_pct_total": lambda v: f"{float(v):,.2f}%",
+                "trades": "{:,.0f}",
+            }
+        ),
+        use_container_width=True,
+        hide_index=True,
+        height=220,
     )
 
     open_df["source_group"] = open_df["source_file"].astype(str).apply(_table_label)
@@ -1652,6 +1760,33 @@ def _render_portfolio_admin_tab() -> None:
         _write_open_positions_cache_rows(remaining)
         st.success(f"Deleted {len(remove_ids)} cached position(s).")
         st.rerun()
+
+    st.markdown("**Closed Trades Cache (current upload cycle)**")
+    closed_df = _load_closed_positions_cache()
+    if closed_df.empty:
+        st.caption("No cached closed trades.")
+        return
+    show_cols = [
+        "source_file",
+        "contract_code",
+        "program",
+        "side",
+        "state_label",
+        "condition",
+        "daily_pl",
+        "notes",
+        "source_line",
+    ]
+    show_cols = [c for c in show_cols if c in closed_df.columns]
+    show = closed_df[show_cols].copy()
+    if "daily_pl" in show.columns:
+        show = show.rename(columns={"daily_pl": "total_pl"})
+    st.dataframe(
+        show,
+        use_container_width=True,
+        hide_index=True,
+        height=_table_height(len(show), min_rows=6, max_rows=20),
+    )
 
 
 def _style_table(df: pd.DataFrame):
@@ -2090,6 +2225,7 @@ def main() -> None:
         for p in UPLOAD_DIR.glob("*.csv"):
             p.unlink(missing_ok=True)
         OPEN_CACHE_PATH.unlink(missing_ok=True)
+        CLOSED_CACHE_PATH.unlink(missing_ok=True)
         st.success("Cleared saved uploaded files.")
         st.rerun()
 
@@ -2105,7 +2241,15 @@ def main() -> None:
         st.rerun()
 
     if uploaded_files:
-        saved_paths = _save_uploaded_files(uploaded_files)
+        upload_sig = _uploaded_files_signature(uploaded_files)
+        prev_sig = st.session_state.get("uploaded_file_sig")
+        if prev_sig != upload_sig:
+            saved_paths = _save_uploaded_files(uploaded_files)
+            # New upload set starts a new closed-trade cycle.
+            CLOSED_CACHE_PATH.unlink(missing_ok=True)
+            st.session_state["uploaded_file_sig"] = upload_sig
+        else:
+            saved_paths = sorted(UPLOAD_DIR.glob("*.csv"))
     else:
         saved_paths = sorted(UPLOAD_DIR.glob("*.csv"))
 
@@ -2132,6 +2276,9 @@ def main() -> None:
         live_only=live_only,
         include_quotes=include_quotes,
     )
+    closed_cache_df = _load_closed_positions_cache()
+    if not closed_cache_df.empty:
+        df = _merge_with_closed_cache(df, closed_cache_df)
     df = _sort_by_sheet_order(df, [p.name for p in saved_paths])
 
     if df.empty:
@@ -2162,6 +2309,7 @@ def main() -> None:
 
     portfolio_df = _build_portfolio_snapshot(display_df.reset_index(drop=True))
     exposure_stats = _session_exposure_stats(display_df.reset_index(drop=True), mode)
+    _save_closed_positions_cache(display_df.reset_index(drop=True))
     _save_open_positions_cache(portfolio_df)
     tab_live, tab_var, tab_risk, tab_admin = st.tabs(["Live Monitor", "VaR to Stop", "Pre-Trade Risk", "Portfolio Admin"])
 
@@ -2183,7 +2331,7 @@ def main() -> None:
                 {"State": "Live, waiting entry", "Color": "Yellow"},
                 {"State": "Entry Triggered, working T1 + stop", "Color": "Orange"},
                 {"State": "Target1 Filled, working T2 + stop@entry", "Color": "Light Blue"},
-                {"State": "Target2 Filled, working T3 + stop@entry", "Color": "Blue"},
+                {"State": "Target2 Filled, working T3 + stop@target1", "Color": "Blue"},
                 {"State": "Target 1 Filled, Stop @ Entry", "Color": "Green"},
                 {"State": "Target 2 Filled, Stop @ Target 1", "Color": "Dark Green"},
                 {"State": "All targets Filled", "Color": "Darkest Green"},
